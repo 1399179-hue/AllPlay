@@ -6,7 +6,6 @@
 //   M1: 核心（AirPlay 协议实现）——Bonjour/RTSP/会话
 //   M2: 蓝牙触发（RFCOMM + iAP2 bootstrap）
 //   M3: 视频（解码缝 → ffmpeg → SDL 纹理）
-//   M5: LVGL UI 叠加（BoxUI 框架）
 // 线程模型：主线程独占 SDL（事件+渲染）；核心/蓝牙/解码各在自己的线程，
 // 只通过 SharedStatus（atomic）与（M3 起的）帧队列跟主线程交互。
 #include "appstate.h"

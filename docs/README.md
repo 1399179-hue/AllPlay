@@ -83,7 +83,6 @@ flowchart LR
 许可全文见 `LICENSE`，upstream 署名见 `THIRD_PARTY_NOTICES.md`。
 
 - 参照 **AirPlay / iAP2 / CarPlay 协议行为**，协议事实整理在 `docs/PROTOCOL-NOTES.md`。
-- UI 层用 **LVGL**（M5 接入；M3 阶段安卓先用 SurfaceView 原生渲染视频）。
 - `identity/` 的 MFi 身份凭证（pk8/p7b）为**单独引入的凭证文件（非代码）**，不入库、需自行准备（见 `.gitignore`）。
 - 依赖只用**系统库**：核心唯一第三方 = OpenSSL；各平台用系统 API
   （Android：BluetoothSocket/NsdManager/MediaCodec/Surface；桌面：SDL2/ffmpeg/BlueZ/Avahi）。
@@ -109,7 +108,7 @@ host/            桌面开发宿主（SDL2，仅验收用）
 | M2 | 蓝牙触发：iAP2 协议栈（识别/MFi/订阅/0x5703/0x4301） | ✅ 软件完成（`iap2_test` 全绿）；Linux 蓝牙传输层（BlueZ）待做 |
 | M3 | 会话+视频：pair-setup/verify、auth-setup、SETUP、ControlCipher、屏幕流 | ✅ **安卓端到端跑通**（`m3_test` 全绿：SRP 对 Python 参考向量 + 假手机全流程 + mock 屏幕流；真机：MediaCodec 解码上屏 + 触摸回传 + 音频播放）；⏳ 桌面 ffmpeg 解码待接 |
 | M4 | 状态栏信息 + 健壮性（重连/关键帧恢复/watchdog） | 部分（关键帧恢复已接） |
-| M5 | LVGL UI（状态页/叠加） | |
+| M5 | UI 状态页/叠加（原生） | |
 
 **自测（无硬件）**：`./build/iap2_test identity`、`./build/m3_test`（均全绿）。
 **身份文件**：`identity/{identity.pk8, certificate.p7b}`（MFi 配件凭证，不入库，需自行准备）。
