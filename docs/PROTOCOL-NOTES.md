@@ -39,7 +39,7 @@ iPhone ──(1) 蓝牙 RFCOMM / iAP2 bootstrap（触发+MFi+推配置）──�
    识别信息里含：我方 EA 协议名、蓝牙链路角色（BOOTSTRAP）、消息列表（我们发的/收的/订阅的）、
    **群组 17 "blue" 用本机蓝牙 MAC**、群组 24 SSID 等。
 2. **MFi 认证**：`0xAA00 RequestCertificate` → `0xAA01 (证书)` → `0xAA02 challenge` → `0xAA03 (签名)` → `0xAA04 失败 / 0xAA05 成功`。
-   签名与证书来自 `identity/`（见 §5.4）。
+   签名与证书由 MFi 配件身份提供（见 §5.4）。
 3. **订阅**：0x4157 / 0x5200 / 0xAE00 / 0x5000 / 0x4154（各有语义，参照清单）。
 4. 收到手机 **`0x5702 RequestAccessoryWiFiConfiguration`** → 回 **`0x5703 AccessoryWiFiConfiguration`**：
    `ssid / passphrase / securityType / channel / [bssid 提示]`（同一局域网模式：填**现有**网络信息）。
@@ -119,7 +119,7 @@ iPhone ──(1) 蓝牙 RFCOMM / iAP2 bootstrap（触发+MFi+推配置）──�
 - 128 位 tag；nonce64 = 4 零字节 + 8 字节 LE 计数器（每方向独立自增）。
 
 ### 5.4 MFi-SAP（`/auth-setup` 与 iAP2 共用身份）
-- 身份文件：`identity/identity.pk8`（PKCS#8 EC P-256 私钥）、`identity/certificate.p7b`（PKCS#7，**已验证 607 字节 < 640**）。
+- MFi 配件身份：EC P-256 私钥（PKCS#8）+ 配件证书（PKCS#7，**已验证 607 字节 < 640**），由外部提供、不入库。
 - 签名：对 **32 字节摘要** 做 ECDSA（不再哈希），输出 **64 字节 raw r‖s**（**不是 DER**）。
   - 摘要构成（协议 MFi-SAP）：`digest = SHA256(accPub(32) ‖ peerPub(32))`；
     **我们的身份是 `LocalMfiAuthenticationClient`（protocolMajor=3）→ 走 SHA256 分支**；

@@ -83,7 +83,6 @@ flowchart LR
 许可全文见 `LICENSE`，upstream 署名见 `THIRD_PARTY_NOTICES.md`。
 
 - 参照 **AirPlay / iAP2 / CarPlay 协议行为**，协议事实整理在 `docs/PROTOCOL-NOTES.md`。
-- `identity/` 的 MFi 身份凭证（pk8/p7b）为**单独引入的凭证文件（非代码）**，不入库、需自行准备（见 `.gitignore`）。
 - 依赖只用**系统库**：核心唯一第三方 = OpenSSL；各平台用系统 API
   （Android：BluetoothSocket/NsdManager/MediaCodec/Surface；桌面：SDL2/ffmpeg/BlueZ/Avahi）。
 
@@ -111,7 +110,6 @@ host/            桌面开发宿主（SDL2，仅验收用）
 | M5 | UI 状态页/叠加（原生） | |
 
 **自测（无硬件）**：`./build/iap2_test identity`、`./build/m3_test`（均全绿）。
-**身份文件**：`identity/{identity.pk8, certificate.p7b}`（MFi 配件凭证，不入库，需自行准备）。
 
 ## 构建
 

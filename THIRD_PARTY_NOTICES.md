@@ -18,8 +18,3 @@
 
 - **LIVI**、**Showcase**：AirPlay / iAP2 / CarPlay 协议研究（DiPlay 亦在其署名中致谢）。
 
-## MFi 配件身份
-
-- `identity/` 下的 MFi 配件身份（`identity.pk8` + `certificate.p7b`）与 DiPlay 使用同一
-  来源：公开的 Carlinkit C2Air 固件中恢复出的实验性配件身份。
-- 该凭证**不入库**（见 `.gitignore`），需自行准备。
