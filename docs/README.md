@@ -4,6 +4,79 @@
 核心是**平台无关 C++**，安卓为产品目标（MediaCodec 解码 / AudioTrack 播放），mac/Linux 保留为
 开发/自测脚手架，Windows 后续。
 
+## 架构
+
+```mermaid
+flowchart TB
+    subgraph HOST["宿主层（组合根 / Composition Root）"]
+        direction LR
+        ANDROID["Android App<br/>MainActivity · AllPlaySessionService<br/>MediaCodecSink · AudioSink<br/>BluetoothService · MdnsService · HotspotManager"]
+        DESKTOP["桌面 Host<br/>macOS/Linux: SDL2<br/>Windows: Win32 窗口"]
+    end
+
+    subgraph ADAPTER["平台适配层（实现 core::port 接口）"]
+        direction LR
+        POSIX["platform/posix<br/>net_posix · mdns(avahi/dns_sd)<br/>bt(IOBluetooth/BlueZ)"]
+        WIN["platform/windows<br/>net_windows(Winsock2)<br/>bt_windows(AF_BTH)<br/>mdns"]
+        JNI["android JNI<br/>jni_bridge.cpp"]
+    end
+
+    subgraph PORT["接口层（core/port，平台无关）"]
+        direction LR
+        TCP["ITcpListener / ITcpStream"]
+        UDP["IUdpSocket"]
+        NET["INetworkInfo"]
+        BT["IBluetooth"]
+        MDNS["IMdnsAdvertiser"]
+        MEDIA["IVideoOutput / IAudioOutput"]
+        STREAM["IByteStream"]
+        PS["PlatformServices"]
+    end
+
+    subgraph CORE["协议核心（core，平台无关，唯一三方依赖 = OpenSSL）"]
+        direction LR
+        AIRPLAY["airplay<br/>rtsp · server · session<br/>video_stream · audio_stream<br/>event_channel · control_cipher · info"]
+        IAP2["iap2<br/>wire · link · wireless_client"]
+        MFI["mfi<br/>mfi_identity"]
+        CRYPTO["crypto<br/>hkdf · chacha20poly1305 · srp6a<br/>x25519 · ed25519 · tlv8 · aes_ctr"]
+        BPLIST["bplist"]
+        BTTRIG["bt<br/>bt_trigger"]
+        IDENTITY["platform<br/>device_identity · pairing_store"]
+        COMMON["common<br/>log"]
+    end
+
+    HOST -->|注入实现| ADAPTER
+    ADAPTER -->|实现| PORT
+    CORE -->|依赖| PORT
+    HOST -->|装配 PlatformServices| CORE
+```
+
+```mermaid
+flowchart LR
+    IPHONE["iPhone<br/>(CarPlay 源端)"]
+
+    subgraph RECEIVER["AllPlay 接收端"]
+        BT_TRIG["蓝牙 iAP2 触发<br/>RFCOMM → 0x4301"]
+        RTSP["RTSP 控制通道 :7000<br/>pair-setup / pair-verify<br/>auth-setup / SETUP / RECORD"]
+        SCREEN["屏幕流 110/111<br/>TCP · H.264 · AVCC→AnnexB"]
+        AUDIO["音频流 100/101/102<br/>UDP RTP · AAC/Opus/LPCM"]
+        EVENT["事件通道 eventPort<br/>触摸/命令 · ControlCipher 加密"]
+        MDNS_B["mDNS 广播<br/>_airplay._tcp"]
+    end
+
+    IPHONE -->|"① 蓝牙连入，发 iAP2"| BT_TRIG
+    BT_TRIG -->|"② 0x4301 引导（SSID/密码/IP/端口）"| IPHONE
+    IPHONE -->|"③ 连 Wi-Fi 后经 mDNS 发现"| MDNS_B
+    IPHONE -->|"④ RTSP 协商"| RTSP
+    RTSP -->|"⑤ 建立数据流"| SCREEN
+    RTSP -->|"⑤ 建立音频流"| AUDIO
+    RTSP -->|"⑤ 建立事件通道"| EVENT
+    SCREEN -->|"H.264 帧 → IVideoOutput 解码上屏"| SCREEN
+    EVENT -->|"触摸 → hidSendReport → 回 iPhone"| IPHONE
+```
+
+> 模块职责表与平台适配矩阵见 [`docs/architecture.md`](docs/architecture.md)。
+
 ## 许可与约束
 
 本项目为 **GPL-3.0**，是 **DiPlay / xcertplay**（均为 GPL-3.0）无线 CarPlay 接收端的 **C++ 重新实现**；
