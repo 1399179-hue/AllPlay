@@ -1,0 +1,19 @@
+# 生成物
+/build/
+
+# 敏感：MFi 身份（私钥 + 证书，不入库）
+/identity/
+
+# 系统 / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Android（Gradle / NDK 生成）
+/android/.gradle/
+/android/**/build/
+/android/local.properties
+/android/**/.cxx/
+*.apk
+*.aab

@@ -1,0 +1,92 @@
+#include "common/log.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+#include <string>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
+namespace core {
+
+namespace {
+std::atomic<int> g_level{static_cast<int>(Level::Info)};
+std::mutex       g_mu;
+
+const char* levelName(Level lv)
+{
+    switch (lv) {
+        case Level::Debug: return "DBG";
+        case Level::Info:  return "INF";
+        case Level::Warn:  return "WRN";
+        case Level::Error: return "ERR";
+    }
+    return "???";
+}
+
+const char* baseName(const char* path)
+{
+    const char* p = std::strrchr(path, '/');
+    return p ? p + 1 : path;
+}
+}  // namespace
+
+void logInitFromEnv()
+{
+    const char* e = std::getenv("ALLPLAY_LOG");
+    if (!e || !*e) return;
+    if (!std::strcmp(e, "debug")) setLogLevel(Level::Debug);
+    else if (!std::strcmp(e, "info")) setLogLevel(Level::Info);
+    else if (!std::strcmp(e, "warn")) setLogLevel(Level::Warn);
+    else if (!std::strcmp(e, "error")) setLogLevel(Level::Error);
+}
+
+void setLogLevel(Level lv) { g_level.store(static_cast<int>(lv)); }
+Level logLevel() { return static_cast<Level>(g_level.load()); }
+
+void logf(Level lv, const char* file, int line, const char* fmt, ...)
+{
+    if (static_cast<int>(lv) < g_level.load(std::memory_order_relaxed)) return;
+
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+
+    // 墙钟时间（秒精度够用；日志不打点、别引入更多依赖）
+    char ts[24] = "";
+    {
+        std::time_t t = std::time(nullptr);
+        std::tm     tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        std::strftime(ts, sizeof ts, "%H:%M:%S", &tm);
+    }
+
+    std::lock_guard<std::mutex> lk(g_mu);
+    std::fprintf(stderr, "[%s] [%s] %s:%d  %s\n", ts, levelName(lv), baseName(file), line, msg);
+    std::fflush(stderr);
+#ifdef __ANDROID__
+    {
+        int prio = ANDROID_LOG_INFO;
+        switch (lv) {
+            case Level::Debug: prio = ANDROID_LOG_DEBUG; break;
+            case Level::Info:  prio = ANDROID_LOG_INFO;  break;
+            case Level::Warn:  prio = ANDROID_LOG_WARN;  break;
+            case Level::Error: prio = ANDROID_LOG_ERROR; break;
+        }
+        __android_log_print(prio, "AllPlay", "%s:%d  %s", baseName(file), line, msg);
+    }
+#endif
+}
+
+}  // namespace core

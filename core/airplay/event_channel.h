@@ -1,0 +1,76 @@
+/**
+ * @file   event_channel.h
+ * @brief  事件通道（M4：HID/触摸回传 + 命令）
+ * @author blt
+ */
+
+// ============================================================================
+// core/airplay/event_channel.h —— 事件通道（M4：HID/触摸回传 + 命令）
+// ============================================================================
+// iPhone 连到 SETUP 响应里的 eventPort。通道用 ControlCipher 加密：
+//   密钥 = HKDF-SHA512(sharedSecret, "Events-Salt", "Events-*", 32)
+//   写方向 = "Events-Write-Encryption-Key"，读方向 = "Events-Read-Encryption-Key"
+// 触摸：把触点编成 HID report，作为 POST /command 的 bplist 体发过去
+//   {"type":"hidSendReport","uuid":"2a2a2a2a","hidReport":<12B report>}
+// 参照 AirPlay 事件通道（sendCommand/sendTouch + HID touchReport）。
+#pragma once
+
+#include "airplay/control_cipher.h"
+#include "airplay/rtsp.h"
+#include "port/tcp.h"
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace core::bplist { class Value; }
+
+namespace core::airplay {
+
+/// 一个触点（坐标归一化 0..1，相对主屏分辨率）。
+struct TouchPoint {
+    float x = 0;
+    float y = 0;
+    bool  down = false;
+};
+
+class EventChannel {
+public:
+    /// listener 需已绑定（port 已知）。sharedSecret = pair-verify 的 shared。
+    EventChannel(std::unique_ptr<core::ITcpListener> listener,
+                 const std::vector<uint8_t>& sharedSecret,
+                 int width, int height);
+    ~EventChannel();
+    EventChannel(const EventChannel&) = delete;
+
+    uint16_t port() const { return port_; }
+    void stop();
+
+    /// 发触摸（归一化坐标 → 缩放成像素 → HID report → 加密 POST /command）。
+    bool sendTouch(const std::vector<TouchPoint>& contacts);
+
+    /// 发任意命令（bplist dict）。
+    bool sendCommand(const std::shared_ptr<core::bplist::Value>& cmd);
+
+private:
+    void run();   // accept + 读侧（解密 + 解析 + 回 200 ACK）
+
+    std::unique_ptr<core::ITcpListener> listener_;
+    int  width_ = 1280, height_ = 720;
+    uint16_t port_ = 0;
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+
+    std::mutex mu_;                          // 保护 stream_/cipher_/cseq_/plain_
+    std::shared_ptr<core::ITcpStream> stream_;
+    std::unique_ptr<ControlCipher> cipher_;
+    uint64_t cseq_ = 0;
+    std::vector<uint8_t> writeKey_, readKey_;
+    std::vector<uint8_t> plain_;             // 读侧解密后的明文缓冲（未凑整帧的部分）
+};
+
+}  // namespace core::airplay
