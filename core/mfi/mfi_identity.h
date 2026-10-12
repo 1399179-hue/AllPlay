@@ -27,6 +27,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstddef>
 
 namespace core::mfi {
 

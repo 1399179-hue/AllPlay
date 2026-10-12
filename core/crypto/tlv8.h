@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <cstddef>
 
 namespace core::crypto {
 

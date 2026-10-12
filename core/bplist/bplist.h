@@ -20,6 +20,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstddef>
 
 namespace core::bplist {
 

@@ -13,6 +13,7 @@
 // 音频（IAudioOutput）属 M4+，本轮只有空桩。
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 

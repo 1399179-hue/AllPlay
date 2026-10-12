@@ -28,6 +28,7 @@
 #include <deque>
 #include <string>
 #include <vector>
+#include <cstddef>
 
 namespace core::iap2 {
 
