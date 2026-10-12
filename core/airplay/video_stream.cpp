@@ -194,16 +194,33 @@ std::vector<uint8_t> ScreenStream::avccToAnnexB(const std::vector<uint8_t>& p)
 
 bool ScreenStream::isRandomAccess(core::VideoCodec codec, const uint8_t* d, size_t n)
 {
+    // 必须扫**整个访问单元**，不能只看第一个 NAL：
+    // 关键帧 AU 的常见排布是 [SPS][PPS][IDR]（手机在关键帧处会内联重发参数集），
+    // 只看首个 NAL 就会读到 SPS(7) 而判成"非关键帧"——闸门于是永远打不开，
+    // 症状是"配置帧收到了、解码器也建好了，但一直黑屏"。真机与假手机都会踩。
+    //
+    // 这样扫是安全的：H.264 载荷有防竞争字节（emulation prevention），
+    // NAL 载荷内部不可能出现 00 00 01，不会把载荷误当成起始码。
     size_t i = 0;
-    while (i + 4 <= n) {
-        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) { i += 3; break; }
-        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1) { i += 4; break; }
-        ++i;
+    while (i + 3 <= n) {
+        size_t sc = 0;
+        if (d[i] == 0 && d[i + 1] == 0) {
+            if (d[i + 2] == 1) sc = 3;
+            else if (d[i + 2] == 0 && i + 3 < n && d[i + 3] == 1) sc = 4;
+        }
+        if (sc == 0) { ++i; continue; }
+
+        const size_t h = i + sc;            // NAL 头字节
+        if (h >= n) break;
+        if (codec == core::VideoCodec::H264) {
+            if ((d[h] & 0x1f) == 5) return true;            // IDR
+        } else {
+            const int type = (d[h] >> 1) & 0x3f;
+            if (type >= 16 && type <= 21) return true;      // HEVC IRAP 16..21
+        }
+        i = h + 1;                          // 继续找下一个 NAL
     }
-    if (i >= n) return false;
-    if (codec == core::VideoCodec::H264) return (d[i] & 0x1f) == 5;   // IDR
-    const int type = (d[i] >> 1) & 0x3f;
-    return type >= 16 && type <= 21;                                   // HEVC IRAP 16..21
+    return false;
 }
 
 }  // namespace core::airplay

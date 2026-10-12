@@ -74,6 +74,11 @@ public:
 
 private:
     ReceiverConfig  cfg_;
+    /// ★ 自己持有一份 PlatformServices（而不是存 start() 参数的地址）。
+    /// Session 比 start() 活得久：它到 SETUP 才第一次用 services_->makeTcpListener
+    /// 去建数据/事件通道，而调用方常传临时对象（host/main.cpp:332）。
+    /// 存参数地址 = 悬垂指针，症状是 SETUP 阶段 SIGSEGV。
+    core::PlatformServices services_;
     DeviceIdentity  identity_;
     DeviceInfo      info_;
     std::string     ifname_, ip_, avahiErr_;

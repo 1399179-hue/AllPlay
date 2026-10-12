@@ -57,7 +57,10 @@ bool Receiver::start(const ReceiverConfig& cfg, const core::PlatformServices& se
     sc.info     = &info_;
     sc.stateDir = stateDir;
     sc.mfiDir   = cfg_.mfiDir;
-    sc.services = &services;
+    // 拷一份自己拿着，再把地址给 Session —— 见 server.h 里 services_ 的注释。
+    // 存 &services（参数地址）在 start() 内是好的，出函数就悬垂。
+    services_   = services;
+    sc.services = &services_;   // NOLINT：指向本对象的成员，Receiver 析构前一直有效
     sc.video    = cfg_.video;
     sc.audio    = cfg_.audio;
     sc.width    = cfg_.width;
