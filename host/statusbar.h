@@ -24,6 +24,9 @@
 
 namespace allplay {
 
+/// 字体族：等宽适合状态栏对齐，无衬线适合启动页 logo
+enum class FontFace { Mono, Sans };
+
 /// 最小文本渲染器（够状态栏用；不做排版）
 class TextRenderer {
 public:
@@ -32,7 +35,9 @@ public:
     TextRenderer(const TextRenderer&) = delete;
 
     /// pixelHeight: 字号像素高（默认 15）。找不到字体返回 false（不致命）。
-    bool init(int pixelHeight = 15);
+    /// bold: 粗体（启动页 logo 用）。TTF_Init/Quit 在多个实例间做了引用计数，
+    /// 所以可以同时存在多个 TextRenderer。
+    bool init(int pixelHeight = 15, FontFace face = FontFace::Mono, bool bold = false);
     bool ok() const { return font_ != nullptr; }
     int  lineHeight() const { return lh_; }
 
@@ -45,6 +50,7 @@ public:
 private:
     TTF_Font* font_ = nullptr;
     int       lh_   = 16;
+    bool      hasRealBold_ = false;
 };
 
 /// 底部状态栏：左侧 = 状态点 + 状态文本；右侧 = 分辨率 / fps / 帧数

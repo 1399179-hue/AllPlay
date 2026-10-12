@@ -8,11 +8,27 @@ namespace allplay {
 namespace {
 
 // 候选字体（第一个能开的就用）。可用 ALLPLAY_FONT 环境变量覆盖。
-const char* const kFontCandidates[] = {
+const char* const kMonoCandidates[] = {
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
 };
+
+const char* const kSansCandidates[] = {
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+};
+
+// 粗体优先用真粗体字面（比 TTF 的合成粗体好看）；拿不到再退到合成
+const char* const kBoldCandidates[] = {
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+};
+
+// TTF_Init/TTF_Quit 是库级全局状态：多个 TextRenderer 共存时必须引用计数，
+// 否则先析构的那个会把还活着的那些字体一起带走。
+int g_ttfRefs = 0;
 
 void drawText(SDL_Renderer* r, TTF_Font* font, int x, int y,
               const std::string& s, SDL_Color c)
@@ -37,18 +53,19 @@ void drawText(SDL_Renderer* r, TTF_Font* font, int x, int y,
 
 TextRenderer::~TextRenderer()
 {
-    if (font_) {
-        TTF_CloseFont(font_);
-        TTF_Quit();
-    }
+    if (font_) TTF_CloseFont(font_);
+    if (g_ttfRefs > 0 && --g_ttfRefs == 0) TTF_Quit();
 }
 
-bool TextRenderer::init(int pixelHeight)
+bool TextRenderer::init(int pixelHeight, FontFace face, bool bold)
 {
-    if (TTF_Init() != 0) {
-        std::fprintf(stderr, "[statusbar] TTF_Init 失败：%s（状态栏不显示文本）\n",
-                     TTF_GetError());
-        return false;
+    if (!font_) {
+        if (g_ttfRefs == 0 && TTF_Init() != 0) {
+            std::fprintf(stderr, "[statusbar] TTF_Init 失败：%s（状态栏不显示文本）\n",
+                         TTF_GetError());
+            return false;
+        }
+        ++g_ttfRefs;
     }
 
     const char* env = std::getenv("ALLPLAY_FONT");
@@ -58,7 +75,15 @@ bool TextRenderer::init(int pixelHeight)
             std::fprintf(stderr, "[statusbar] ALLPLAY_FONT=\"%s\" 打不开：%s\n",
                          env, TTF_GetError());
     }
-    for (const char* p : kFontCandidates) {
+    // 粗体先试真粗体字面，再退到当前族
+    if (bold) {
+        for (const char* p : kBoldCandidates) {
+            if (font_) break;
+            font_ = TTF_OpenFont(p, pixelHeight);
+            if (font_) hasRealBold_ = true;
+        }
+    }
+    for (const char* p : (face == FontFace::Sans ? kSansCandidates : kMonoCandidates)) {
         if (font_) break;
         font_ = TTF_OpenFont(p, pixelHeight);
     }
@@ -67,6 +92,7 @@ bool TextRenderer::init(int pixelHeight)
                              "—— 状态栏降级为色块\n");
         return false;
     }
+    if (bold && !hasRealBold_) TTF_SetFontStyle(font_, TTF_STYLE_BOLD);
     lh_ = TTF_FontLineSkip(font_);
     return true;
 }
@@ -147,9 +173,16 @@ void StatusBar::draw(SDL_Renderer* r, const SharedStatus& st) const
     const int vh = st.videoH.load(std::memory_order_relaxed);
     const int fps = st.fps.load(std::memory_order_relaxed);
     const uint64_t frames = st.frames.load(std::memory_order_relaxed);
+    // 音频只在真有流时才出现（没音频流时显示 0 只会让人以为坏了）
+    const uint64_t aframes = st.audioFrames.load(std::memory_order_relaxed);
+    const uint64_t aunder  = st.audioUnderruns.load(std::memory_order_relaxed);
+    char abuf[48] = "";
+    if (aframes > 0)
+        std::snprintf(abuf, sizeof abuf, " | a:%llu%s", static_cast<unsigned long long>(aframes),
+                      aunder > 0 ? "!" : "");   // "!" = 音频缓冲欠载过
     if (vw > 0 && vh > 0) {
-        std::snprintf(buf, sizeof buf, "%dx%d | %d fps | %llu frames",
-                      vw, vh, fps, static_cast<unsigned long long>(frames));
+        std::snprintf(buf, sizeof buf, "%dx%d | %d fps | %llu frames%s",
+                      vw, vh, fps, static_cast<unsigned long long>(frames), abuf);
     } else {
         std::snprintf(buf, sizeof buf, "allplay (M0: 显示管线未接入)");
     }

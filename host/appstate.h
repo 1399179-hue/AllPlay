@@ -49,6 +49,8 @@ struct SharedStatus {
     std::atomic<int>       fps{0};           ///< 解码显示帧率（1 秒窗口）
     std::atomic<uint64_t>  frames{0};        ///< 累计显示帧数
     std::atomic<uint64_t>  lastFrameMs{0};   ///< 最近一帧的墙钟毫秒（0 = 还没有过）
+    std::atomic<uint64_t>  audioFrames{0};   ///< 音频解出/收下的帧数（0 = 没有音频流）
+    std::atomic<uint64_t>  audioUnderruns{0};///< 音频缓冲欠载次数（>0 说明卡顿过）
 
     // 只在 state 切到 Error 时由写方更新
     void setError(const std::string& msg)

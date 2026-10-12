@@ -1,33 +1,70 @@
 // ============================================================================
-// main.cpp —— Ubuntu 无线 CarPlay 接收端宿主（M0：窗口 + 状态栏骨架）
+// main.cpp —— 桌面宿主（组合根）：核心 + 解码上屏 + 启动页 + 触摸回传
 // ============================================================================
 //
-// 这个进程就是"车机"侧宿主：后续里程碑会在这里接上
-//   M1: 核心（AirPlay 协议实现）——Bonjour/RTSP/会话
-//   M2: 蓝牙触发（RFCOMM + iAP2 bootstrap）
-//   M3: 视频（解码缝 → ffmpeg → SDL 纹理）
-// 线程模型：主线程独占 SDL（事件+渲染）；核心/蓝牙/解码各在自己的线程，
-// 只通过 SharedStatus（atomic）与（M3 起的）帧队列跟主线程交互。
+// 这个进程就是"车机"侧宿主。装配顺序照 tools/core_selftest.cpp 与
+// host/windows_main.cpp：平台服务 → ReceiverConfig → Receiver::start → SDL 主循环。
+//
+// 线程模型：
+//   主线程独占 SDL（事件 + 渲染 + 音频设备开关）。
+//   core 的屏幕流/音频流/RTSP 线程只碰 SdlVideoSink / SdlAudioSink，
+//   那是两个自带锁的对象，主线程通过 present()/tick() 取结果。
+//   跨线程的展示状态走 SharedStatus（atomic）。
+//
+// 界面两态：
+//   未连接 = 启动页铺满整窗（白底 + 蓝牙水纹 + 双色 logo + 状态文字）
+//   连接后 = 视频铺满整窗（letterbox），状态栏改为 --statusbar 显式开启的调试叠加
 #include "appstate.h"
+#include "launcher.h"
+#include "screenshot.h"
 #include "statusbar.h"
+
+#include "airplay/server.h"
+#include "common/log.h"
+#include "posix/posix.h"
+
+#ifdef ALLPLAY_HAVE_FFMPEG
+#  include "media/sdl_audio_sink.h"
+#  include "media/sdl_video_sink.h"
+#endif
 
 #include <SDL.h>
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
+volatile std::sig_atomic_t g_stop = 0;
+void onSignal(int) { g_stop = 1; }
+
 struct Options {
-    int         screenW  = 1280;
-    int         screenH  = 720;
-    int         barH     = 26;
+    int         screenW   = 1280;
+    int         screenH   = 720;
+    int         barH      = 26;
+    bool        barOn     = false;   // --statusbar：调试叠加（默认关，保证真·全屏视频）
     bool        fullscreen = false;
-    int         frames   = 0;      // >0：渲染 N 帧后退出（容器冒烟用）
-    std::string font;              // --font，可空（空则用候选表）
-    bool        help     = false;
+    int         frames    = 0;       // >0：渲染 N 帧后退出（容器冒烟用）
+    std::string font;                // --font，可空（空则用候选表）
+    // —— 核心侧 ——
+    uint16_t    port      = 7000;
+    std::string ifname;
+    std::string name      = "AllPlay";
+    std::string stateDir;
+    std::string identityDir = "identity";
+    bool        noAvahi   = false;
+    bool        noVideo   = false;
+    bool        noAudio   = false;
+    std::string dump;                // --dump：退出前把最后一帧存成 PPM
+    // --inject-touch U,V：连上后往 SDL 事件队列塞一对按下/抬起，坐标按**视频矩形**归一化。
+    // 无头（SDL_VIDEODRIVER=dummy）时没有任何真实输入，这是唯一能自动验触摸链路的办法。
+    float       injectU   = -1.f;
+    float       injectV   = -1.f;
+    bool        help      = false;
 };
 
 void printUsage(const char* argv0)
@@ -36,9 +73,21 @@ void printUsage(const char* argv0)
         "用法: %s [选项]\n"
         "  --screen WxH      视频面尺寸（默认 1280x720，也是向手机协商的目标分辨率）\n"
         "  --fullscreen      全屏（SDL_WINDOW_FULLSCREEN_DESKTOP）\n"
+        "  --statusbar       叠加状态栏（调试用；默认关，接了视频就是全屏画面）\n"
         "  --statusbar-h N   状态栏高度（默认 26）\n"
-        "  --font PATH       状态栏字体（默认 DejaVu；可用 ALLPLAY_FONT 环境变量）\n"
+        "  --font PATH       字体（默认 DejaVu；可用 ALLPLAY_FONT 环境变量）\n"
         "  --frames N        渲染 N 帧后退出（无头冒烟测试用，如 SDL_VIDEODRIVER=dummy）\n"
+        "  --port N          RTSP 端口（默认 7000，被占自动 +1）\n"
+        "  --ifname IFACE     指定网卡（默认自动挑）\n"
+        "  --name S          Bonjour 里显示的名字（默认 AllPlay）\n"
+        "  --state-dir DIR   状态目录（默认 core 的 defaultStateDir()）\n"
+        "  --identity DIR    MFi 身份目录（默认 identity）\n"
+        "  --no-avahi        不广播 Bonjour\n"
+        "  --no-video        不建视频输出（排查用：只跑协议不上屏）\n"
+        "  --no-audio        不建音频输出（排查用；无声卡时也可用 SDL_AUDIODRIVER=dummy）\n"
+        "  --dump PATH       退出前把最后一帧画面存成 PPM（无人值守时校验界面）\n"
+        "  --inject-touch U,V 连上后自动注入一次触摸（U/V 按视频矩形归一化 0..1）——\n"
+        "                    无头验证触摸链路用，配 tools/fake_phone 看它打印的坐标\n"
         "  -h, --help        显示本帮助\n"
         "\n"
         "退出：窗口关闭 / ESC / Ctrl-C。\n",
@@ -68,6 +117,8 @@ bool parseArgs(int argc, char** argv, Options* o)
             }
         } else if (!std::strcmp(a, "--fullscreen")) {
             o->fullscreen = true;
+        } else if (!std::strcmp(a, "--statusbar")) {
+            o->barOn = true;
         } else if (!std::strcmp(a, "--statusbar-h")) {
             o->barH = std::atoi(need(a));
             if (o->barH < 10 || o->barH > 200) {
@@ -78,6 +129,32 @@ bool parseArgs(int argc, char** argv, Options* o)
             o->font = need(a);
         } else if (!std::strcmp(a, "--frames")) {
             o->frames = std::atoi(need(a));
+        } else if (!std::strcmp(a, "--port")) {
+            o->port = uint16_t(std::atoi(need(a)));
+        } else if (!std::strcmp(a, "--ifname")) {
+            o->ifname = need(a);
+        } else if (!std::strcmp(a, "--name")) {
+            o->name = need(a);
+        } else if (!std::strcmp(a, "--state-dir")) {
+            o->stateDir = need(a);
+        } else if (!std::strcmp(a, "--identity")) {
+            o->identityDir = need(a);
+        } else if (!std::strcmp(a, "--no-avahi")) {
+            o->noAvahi = true;
+        } else if (!std::strcmp(a, "--no-video")) {
+            o->noVideo = true;
+        } else if (!std::strcmp(a, "--no-audio")) {
+            o->noAudio = true;
+        } else if (!std::strcmp(a, "--dump")) {
+            o->dump = need(a);
+        } else if (!std::strcmp(a, "--inject-touch")) {
+            const char* v = need(a);
+            if (std::sscanf(v, "%f,%f", &o->injectU, &o->injectV) != 2 ||
+                o->injectU < 0.f || o->injectU > 1.f ||
+                o->injectV < 0.f || o->injectV > 1.f) {
+                std::fprintf(stderr, "--inject-touch 需要 U,V（各 0..1），如 0.25,0.75\n");
+                return false;
+            }
         } else if (!std::strcmp(a, "-h") || !std::strcmp(a, "--help")) {
             o->help = true;
         } else {
@@ -87,6 +164,105 @@ bool parseArgs(int argc, char** argv, Options* o)
     }
     return true;
 }
+
+/// 触摸：core 的 event_channel 就是固定 2 个 slot（event_channel.cpp:20-37），
+/// 所以这里也维护 2 个，**永远发满 2 个** —— slot 编号稳定，手机侧才不会看到
+/// "slot1 忽然冒出来"。
+/// 桌面上鼠标和触屏一般不会同时用：鼠标固定占 slot 0，手指从空位开始占。
+class TouchPad {
+public:
+    void handle(const SDL_Event& e, int winW, int winH)
+    {
+        switch (e.type) {
+            case SDL_MOUSEBUTTONDOWN:
+                if (e.button.which == SDL_TOUCH_MOUSEID) break;   // 触屏合成的鼠标事件，忽略
+                if (e.button.button != SDL_BUTTON_LEFT) break;
+                slots_[0].down = true;
+                slots_[0].x = float(e.button.x);
+                slots_[0].y = float(e.button.y);
+                dirty_ = true;
+                break;
+            case SDL_MOUSEBUTTONUP:
+                if (e.button.which == SDL_TOUCH_MOUSEID) break;
+                if (e.button.button != SDL_BUTTON_LEFT) break;
+                slots_[0].down = false;
+                dirty_ = true;
+                break;
+            case SDL_MOUSEMOTION:
+                if (e.motion.which == SDL_TOUCH_MOUSEID) break;
+                if (!slots_[0].down) break;
+                slots_[0].x = float(e.motion.x);
+                slots_[0].y = float(e.motion.y);
+                dirty_ = true;
+                break;
+            case SDL_FINGERDOWN:
+            case SDL_FINGERMOTION:
+            case SDL_FINGERUP: {
+                // FINGER 的坐标是窗口归一化的 0..1，换算成像素跟鼠标统一处理
+                const int i = fingerSlot(e.tfinger.fingerId);
+                if (i < 0) break;   // 已经 2 个触点了，多的忽略
+                slots_[i].down = (e.type != SDL_FINGERUP);
+                slots_[i].x = e.tfinger.x * float(winW);
+                slots_[i].y = e.tfinger.y * float(winH);
+                dirty_ = true;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    /// 把当前触点状态发给手机。rect = letterbox 后的视频矩形（坐标按它归一化）。
+    /// 落在黑边上的点直接不发 —— clamp 会让边缘误触。
+    void flush(core::airplay::Receiver& rx, const SDL_Rect& rect, bool active)
+    {
+        if (!active) {
+            if (wasActive_) {   // 断开前把手指"抬起来"，免得手机侧卡在按下态
+                rx.sendTouch(std::vector<core::airplay::TouchPoint>(2));
+                wasActive_ = false;
+            }
+            return;
+        }
+        if (!dirty_) return;
+        dirty_ = false;
+        wasActive_ = true;
+
+        std::vector<core::airplay::TouchPoint> pts(2);
+        for (int i = 0; i < 2; ++i) {
+            if (!slots_[i].down || rect.w <= 0 || rect.h <= 0) continue;
+            const float u = (slots_[i].x - float(rect.x)) / float(rect.w);
+            const float v = (slots_[i].y - float(rect.y)) / float(rect.h);
+            if (u < 0.f || u > 1.f || v < 0.f || v > 1.f) continue;   // 黑边上，忽略
+            pts[i].x = u;
+            pts[i].y = v;
+            pts[i].down = true;
+        }
+        rx.sendTouch(pts);
+    }
+
+    void reset()
+    {
+        slots_[0] = slots_[1] = Slot{};
+        dirty_ = false;
+    }
+
+private:
+    struct Slot { bool down = false; float x = 0, y = 0; SDL_FingerID id = -1; };
+
+    /// 已有该手指 → 原 slot；否则找空位（鼠标占着 0 时从 1 开始找）
+    int fingerSlot(SDL_FingerID id)
+    {
+        for (int i = 0; i < 2; ++i)
+            if (slots_[i].id == id) return i;
+        for (int i = (slots_[0].down && slots_[0].id < 0) ? 1 : 0; i < 2; ++i)
+            if (!slots_[i].down) { slots_[i].id = id; return i; }
+        return -1;
+    }
+
+    Slot slots_[2];
+    bool dirty_ = false;
+    bool wasActive_ = false;
+};
 
 }  // namespace
 
@@ -100,11 +276,14 @@ int main(int argc, char** argv)
     }
     if (!opt.font.empty()) setenv("ALLPLAY_FONT", opt.font.c_str(), 1);
 
-    std::printf("[host] allplay_host (M0) — 视频面 %dx%d，状态栏 %dpx%s\n",
-                opt.screenW, opt.screenH, opt.barH,
-                opt.fullscreen ? "，全屏" : "");
+    std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+    core::logInitFromEnv();
+    std::printf("[host] allplay_host — 视频面 %dx%d%s\n",
+                opt.screenW, opt.screenH, opt.fullscreen ? "，全屏" : "");
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
         std::fprintf(stderr, "[host] SDL_Init 失败：%s\n", SDL_GetError());
         return 1;
     }
@@ -113,7 +292,7 @@ int main(int argc, char** argv)
     if (opt.fullscreen) winFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     SDL_Window* win = SDL_CreateWindow(
         "AllPlay", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        opt.screenW, opt.screenH + opt.barH, winFlags);
+        opt.screenW, opt.screenH, winFlags);
     if (!win) {
         std::fprintf(stderr, "[host] 建窗口失败：%s\n", SDL_GetError());
         SDL_Quit();
@@ -136,38 +315,205 @@ int main(int argc, char** argv)
     }
 
     allplay::SharedStatus status;
-    // M0：还没有蓝牙/核心，直接停在"等配对"这个名义状态（M2 起由 bt 层驱动）
-    status.state.store(static_cast<int>(allplay::LinkState::WaitingPair));
-
-    allplay::StatusBar bar;
+    allplay::StatusBar   bar;
     bar.init(ren, opt.screenW, opt.screenH, opt.barH);
+    allplay::Launcher    launcher;
+    if (!launcher.init()) {
+        std::fprintf(stderr, "[host] 启动页字体不可用，只画图形\n");
+    }
 
-    bool running = true;
-    int  rendered = 0;
-    while (running) {
+    // —— 解码输出：必须在 Receiver 之前声明，才能比它活得久 ——
+    // Receiver 的屏幕流线程会一直持有 video 指针直到 stop() 返回。
+    core::IVideoOutput* vid = nullptr;
+    core::IAudioOutput* aud = nullptr;
+#ifdef ALLPLAY_HAVE_FFMPEG
+    allplay::SdlVideoSink videoSink;
+    allplay::SdlAudioSink audioSink;
+    if (!opt.noVideo) vid = &videoSink;
+    if (!opt.noAudio) aud = &audioSink;
+#else
+    if (!opt.noVideo || !opt.noAudio)
+        std::fprintf(stderr, "[host] 本次构建没带 ffmpeg —— 视频/音频降级（只有启动页）\n");
+#endif
+
+    // —— 启动协议核心 ——
+    core::airplay::Receiver rx;
+    core::airplay::ReceiverConfig cfg;
+    cfg.name      = opt.name;
+    cfg.ifname    = opt.ifname;
+    cfg.port      = opt.port;
+    cfg.width     = opt.screenW;
+    cfg.height    = opt.screenH;
+    cfg.stateDir  = opt.stateDir;
+    cfg.mfiDir    = opt.identityDir;
+    cfg.enableAvahi = !opt.noAvahi;
+    cfg.video     = vid;
+    cfg.audio     = aud;
+
+    std::string err;
+    if (!rx.start(cfg, allplay::posix::makePlatformServices(), &err)) {
+        std::fprintf(stderr, "[host] 核心启动失败：%s\n", err.c_str());
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
+    std::printf("[host] RTSP :%u  ifname=%s ip=%s deviceid=%s\n",
+                rx.port(), rx.ifname().c_str(), rx.ip().c_str(), rx.info().deviceId.c_str());
+    if (cfg.enableAvahi) {
+        std::printf("[host] Bonjour: %s\n",
+                    rx.avahiError().empty() ? "已广播 _airplay._tcp"
+                                            : ("不可用（" + rx.avahiError() + "）").c_str());
+    }
+    std::printf("[host] READY —— 等 iPhone 连接（假手机：tools/fake_phone）\n");
+    std::fflush(stdout);
+
+    TouchPad pad;
+
+    bool     running   = true;
+    int      rendered  = 0;
+    int      injectStep = 0;   ///< 连上后数帧，--inject-touch 的按下/抬起就落在固定帧上
+    bool     wasStreaming = false;
+    Uint64   lastFpsAt = SDL_GetTicks64();
+    uint64_t lastFrames = 0;
+
+    while (running && !g_stop) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            else pad.handle(e, opt.screenW, opt.screenH);
         }
 
-        // 视频区（M3 起贴视频纹理；现在纯黑）
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-        SDL_RenderClear(ren);
+#ifdef ALLPLAY_HAVE_FFMPEG
+        // 音频设备只能主线程开关（SDL 的约定），RTSP 线程来的 configure() 只记待办。
+        // 没变化时它立刻返回，放这里每帧调没有代价。
+        audioSink.serviceDevice();
+        status.audioFrames.store(audioSink.decoded());
+        status.audioUnderruns.store(audioSink.underruns());
+#endif
 
-        bar.draw(ren, status);
+        // —— 核心状态 → LinkState ——
+        allplay::LinkState st;
+        if (!rx.running())          st = allplay::LinkState::Error;
+        else if (rx.sessionActive()) st = allplay::LinkState::Streaming;
+        else if (rx.connecting())    st = allplay::LinkState::Connecting;
+        else                         st = allplay::LinkState::WaitingPair;
+        status.state.store(static_cast<int>(st));
 
+        // 进入 Streaming 的那一刻切全屏（对齐安卓：连上就铺满）
+        const bool streaming = (st == allplay::LinkState::Streaming);
+        if (streaming != wasStreaming) {
+            wasStreaming = streaming;
+            pad.reset();
+            std::printf("[host] 会话%s\n", streaming ? "开始 —— 切视频面" : "结束 —— 回启动页");
+            std::fflush(stdout);
+            if (streaming && opt.fullscreen) {
+                SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+            }
+        }
+
+        int winW = 0, winH = 0;
+        SDL_GetRendererOutputSize(ren, &winW, &winH);
+
+        // 状态栏只在显式开启时占位置
+        const int barH = opt.barOn ? bar.height() : 0;
+        const int areaY = 0;
+        const int areaH = winH - barH;
+
+        SDL_Rect videoRect{0, 0, 0, 0};
+#ifdef ALLPLAY_HAVE_FFMPEG
+        if (streaming || videoSink.hasFrame()) {
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            SDL_RenderClear(ren);
+            int vw = 0, vh = 0;
+            videoSink.intrinsicSize(&vw, &vh);
+            allplay::fitLetterbox(vw, vh, winW, areaH, &videoRect);
+            videoRect.y += areaY;
+            videoSink.present(ren, videoRect);
+            status.videoW.store(vw);
+            status.videoH.store(vh);
+            status.frames.store(videoSink.presented());
+        } else
+#endif
+        {
+            launcher.draw(ren, winW, winH, st, SDL_GetTicks64());
+        }
+
+        if (opt.barOn) bar.draw(ren, status);
         SDL_RenderPresent(ren);
 
+        pad.flush(rx, videoRect, streaming);
+
+        // —— 无头触摸注入（--inject-touch）——
+        // 塞进 SDL 事件队列，下一轮 SDL_PollEvent 取出后走的是**和真实鼠标完全相同**的
+        // TouchPad::handle 路径；差别只在没经过 X11/Wayland 输入驱动。
+        // 时机：连上后第 20 帧按下、第 50 帧抬起 —— 中间隔着 30 帧，好让手机侧看清
+        // "按下"与"抬起"是两次独立上报。
+        if (opt.injectU >= 0.f && streaming && videoRect.w > 0 && videoRect.h > 0) {
+            ++injectStep;
+            if (injectStep == 20 || injectStep == 50) {
+                const bool down = (injectStep == 20);
+                const Sint32 px = videoRect.x + Sint32(opt.injectU * float(videoRect.w));
+                const Sint32 py = videoRect.y + Sint32(opt.injectV * float(videoRect.h));
+                SDL_Event ev{};
+                ev.type            = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+                ev.button.type     = ev.type;
+                ev.button.state    = down ? SDL_PRESSED : SDL_RELEASED;
+                ev.button.button   = SDL_BUTTON_LEFT;
+                ev.button.which    = 0;          // 真鼠标（SDL_TOUCH_MOUSEID 才是触屏合成的）
+                ev.button.clicks   = 1;
+                ev.button.x        = px;
+                ev.button.y        = py;
+                SDL_PushEvent(&ev);
+                std::printf("[host] 注入触摸%s：窗口(%d,%d) 视频矩形 %dx%d@(%d,%d) → 归一化 %.3f,%.3f\n",
+                            down ? "按下" : "抬起",
+                            int(px), int(py), videoRect.w, videoRect.h, videoRect.x, videoRect.y,
+                            double(opt.injectU), double(opt.injectV));
+                std::fflush(stdout);
+            }
+        } else if (!streaming) {
+            injectStep = 0;   // 断开重连后重新数，别让第二次会话直接跳过注入点
+        }
+
+        // 1 秒窗口的显示帧率
+        const Uint64 now = SDL_GetTicks64();
+        if (now - lastFpsAt >= 1000) {
+            const uint64_t f = status.frames.load();
+            status.fps.store(int(f - lastFrames));
+            lastFrames = f;
+            lastFpsAt  = now;
+            status.lastFrameMs.store(now);
+        }
+
+        if (!opt.dump.empty() && opt.frames > 0 && rendered == opt.frames - 1) {
+            allplay::dumpRender(ren, opt.dump);
+        }
         if (opt.frames > 0 && ++rendered >= opt.frames) {
             std::printf("[host] 冒烟：已渲染 %d 帧，正常退出\n", rendered);
             break;
         }
-        if (!vsync) SDL_Delay(16);   // 软件渲染时按 ~60fps 走
+        if (!vsync) SDL_Delay(16);
     }
 
+    std::printf("[host] 收尾：停核心…\n");
+    std::fflush(stdout);
+    rx.stop();          // 先停核心（join 屏幕流/音频流线程），再让 sink 析构
+#ifdef ALLPLAY_HAVE_FFMPEG
+    // 音频不做"有没有声音"的自动判定（无头跑时设备是 dummy，听不见）；
+    // 这里给出的是**可机检**的证据：解出多少帧（对上手机发的帧数就说明解码链通）、
+    // 缓冲欠载几次、被挤掉几次。⚠️ 无头下的欠载数不可当音质指标：dummy 声卡不按
+    // 实时节奏回调，抖动都记在它头上，要看音质得跑到真有声卡的机器上。
+    std::printf("[host] 音频：解码 %llu 帧、缓冲欠载 %llu 次（dummy 声卡下不可当音质指标）、"
+                "溢出丢最旧 %llu 次%s\n",
+                (unsigned long long)audioSink.decoded(),
+                (unsigned long long)audioSink.underruns(),
+                (unsigned long long)audioSink.dropped(),
+                audioSink.deviceOpen() ? "" : "（设备没开）");
+#endif
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
+    std::printf("[host] 已退出\n");
     return 0;
 }

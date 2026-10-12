@@ -104,7 +104,7 @@ host/            桌面开发宿主（SDL2，仅验收用）
 |---|---|---|
 | M0 | 骨架：CMake + SDL 窗口/状态栏 + 脚本 | ✅ |
 | M1 | core：RTSP + `/info`(bplist) + mDNS 广播 `_airplay._tcp` | ✅ |
-| M2 | 蓝牙触发：iAP2 协议栈（识别/MFi/订阅/0x5703/0x4301） | ✅ 软件完成（`iap2_test` 全绿）；Linux 蓝牙传输层（BlueZ）待做 |
+| M2 | 蓝牙触发：iAP2 协议栈（识别/MFi/订阅/0x5703/0x4301） | ✅ 软件完成（`iap2_test` 全绿）；**Linux BlueZ 传输层已接通真机** —— SDP 查到 iAP2 记录（RFCOMM 通道 1）并连上 iPhone 16，走完 iAP2 识别、收到手机主动发来的 `0xAA00 请求证书`。⏳ 再往后需要 **MFi 身份**（`identity/`），非代码问题 |
 | M3 | 会话+视频：pair-setup/verify、auth-setup、SETUP、ControlCipher、屏幕流 | ✅ **安卓端到端跑通**（`m3_test` 全绿：SRP 对 Python 参考向量 + 假手机全流程 + mock 屏幕流；真机：MediaCodec 解码上屏 + 触摸回传 + 音频播放）；⏳ 桌面 ffmpeg 解码待接 |
 | M4 | 状态栏信息 + 健壮性（重连/关键帧恢复/watchdog） | 部分（关键帧恢复已接） |
 | M5 | UI 状态页/叠加（原生） | |

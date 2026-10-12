@@ -5,9 +5,13 @@
 # 覆盖的依赖：
 #   - 构建：build-essential / cmake / pkg-config
 #   - 核心：libssl-dev（AES/SHA/ECDSA）；libbluetooth-dev + bluez（无线触发的 RFCOMM/SDP）
-#   - 宿主：libsdl2-dev + libsdl2-ttf-dev（窗口/状态栏）；libavcodec/avformat/swscale/avutil-dev（H.264 解码）
+#   - 宿主：libsdl2-dev + libsdl2-ttf-dev（窗口/状态栏）；libavcodec/libavutil/libswscale-dev（H.264 解码 + 像素格式转换）
 #   - 预留：libusb-1.0-0-dev（未来有线 CarPlay/USBMUX）、libdbus-1-dev（BlueZ D-Bus 备选路径）
-# 注意：**不带** fdk-aac（音频不做，核心走 AudioConverterLite_dummy）。
+# 注意：
+#   · **不带** fdk-aac —— Apple 端音频走 AAC-LC/Opus/LPCM，一律用 ffmpeg 自带解码器。
+#   · **不带** libswresample-dev —— 宿主只用"平面 float → 交织 s16"这一种转换，自己写，
+#     顺带绕开它在 ffmpeg 4.4 / 5.1+ 之间那套 channel-layout 参数签名差异。
+#   · libavformat-dev 本项目用不到（无容器/无解复用），但留着无害。
 set -euo pipefail
 
 SUDO=""

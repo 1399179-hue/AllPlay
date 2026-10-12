@@ -34,6 +34,13 @@ add_executable(m3_test tools/m3_test.cpp)
 target_link_libraries(m3_test PRIVATE allplay_core)
 target_compile_options(m3_test PRIVATE -Wall -Wextra)
 
+# 假 iPhone：对着真宿主跑完 RTSP + 加密屏幕流（端到端验收，不需要真机）。
+# 有意**不依赖 SDL/ffmpeg** —— 它只推裸 H.264，自己解析 AnnexB。
+# 因此它在任何能编 core 的机器上都能编，包括没有图形栈的目标机。
+add_executable(fake_phone tools/fake_phone.cpp)
+target_link_libraries(fake_phone PRIVATE allplay_core)
+target_compile_options(fake_phone PRIVATE -Wall -Wextra)
+
 # ---------------------------------------------------------------------------
 # 平台适配 + 桌面宿主：仅 Unix（Windows 的 Winsock2 适配层待做）
 # ---------------------------------------------------------------------------
@@ -84,17 +91,51 @@ if(NOT WIN32)
     # 桌面开发宿主（SDL2，可选：缺 SDL2/SDL2_ttf 时跳过）
     pkg_check_modules(SDL2    IMPORTED_TARGET sdl2)
     pkg_check_modules(SDL2TTF IMPORTED_TARGET SDL2_ttf)
+    # ffmpeg 软解：只要 avcodec/avutil/swscale。
+    # **故意不要 swresample**：它整套 channel-layout 参数在 4.4 与 5.1+ 之间签名不同，
+    # 而我们的音频转换只有"平面 float → 交织 s16"这一件事，自己写更省事（见 ffmpeg_compat.h）。
+    pkg_check_modules(AV      IMPORTED_TARGET libavcodec libavutil libswscale)
     if(SDL2_FOUND AND SDL2TTF_FOUND)
         add_executable(allplay_host
             host/main.cpp
             host/statusbar.cpp
+            host/launcher.cpp
         )
         target_include_directories(allplay_host PRIVATE host)
-        target_link_libraries(allplay_host PRIVATE PkgConfig::SDL2 PkgConfig::SDL2TTF)
+        target_link_libraries(allplay_host PRIVATE
+            allplay_posix                     # PUBLIC 带出 allplay_core + OpenSSL + avahi/IOBluetooth
+            PkgConfig::SDL2
+            PkgConfig::SDL2TTF)
+        if(AV_FOUND)
+            target_sources(allplay_host PRIVATE
+                host/media/ffmpeg_decoder.cpp
+                host/media/sdl_video_sink.cpp
+                host/media/sdl_audio_sink.cpp)
+            target_link_libraries(allplay_host PRIVATE PkgConfig::AV)
+            target_compile_definitions(allplay_host PRIVATE ALLPLAY_HAVE_FFMPEG=1)
+            message(STATUS "桌面宿主 allplay_host: 启用（含 ffmpeg 软解）")
+        else()
+            message(STATUS "桌面宿主 allplay_host: 启用，但缺 ffmpeg —— 视频降级为桩")
+        endif()
         target_compile_options(allplay_host PRIVATE -Wall -Wextra)
-        message(STATUS "桌面宿主 allplay_host: 启用")
     else()
         message(STATUS "桌面宿主 allplay_host: 跳过（缺 SDL2/SDL2_ttf）")
+    endif()
+
+    # 视频冒烟：本地喂 AnnexB H.264，验证"解码 → letterbox 上屏"（不碰协议/网络/蓝牙）。
+    # 排查黑屏时的二分点：有画面 = 协议侧的锅，没画面 = 解码侧的锅。
+    if(SDL2_FOUND AND AV_FOUND)
+        add_executable(video_probe
+            tools/video_probe.cpp
+            host/media/ffmpeg_decoder.cpp
+            host/media/sdl_video_sink.cpp)
+        target_include_directories(video_probe PRIVATE host)
+        target_link_libraries(video_probe PRIVATE
+            allplay_core                      # 只为 port/media.h 的 VideoCodec 等类型
+            PkgConfig::SDL2
+            PkgConfig::AV)
+        target_compile_options(video_probe PRIVATE -Wall -Wextra)
+        message(STATUS "视频冒烟 video_probe: 启用")
     endif()
 else()
     # Windows：Winsock2 适配 + Win32 宿主（1280×720 窗口）
