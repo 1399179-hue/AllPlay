@@ -10,6 +10,7 @@
 #include <avahi-client/publish.h>
 #include <avahi-common/error.h>
 #include <avahi-common/simple-watch.h>
+#include <avahi-common/strlst.h>
 
 #include <atomic>
 #include <chrono>
@@ -93,14 +94,20 @@ private:
             }
         }
         if (avahi_entry_group_is_empty(self->group_)) {
-            std::vector<const char*> cstr;
-            cstr.reserve(self->txt_.size());
-            for (const auto& s : self->txt_) cstr.push_back(s.c_str());
+            // 注意：avahi_entry_group_add_service() 是可变参数接口，它把 `...` 当成
+            // 一串以 NULL 结尾的 const char*。传 cstr.data()（一个 const char**）会让
+            // avahi 把**指针数组自身的内存**当字符串读，TXT 记录变成几个字节的二进制垃圾
+            // ——iPhone 读不到 features/flags/deviceid 就不会来连 AirPlay。
+            // 必须用 strlst 版本，配 AvahiStringList。
+            AvahiStringList* lst = nullptr;
+            for (auto it = self->txt_.rbegin(); it != self->txt_.rend(); ++it)
+                lst = avahi_string_list_add(lst, it->c_str());  // add 是头插，倒着加才是原序
 
-            int r = avahi_entry_group_add_service(
+            int r = avahi_entry_group_add_service_strlst(
                 self->group_, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, (AvahiPublishFlags)0,
                 self->name_.c_str(), "_airplay._tcp", nullptr, nullptr,
-                self->port_, cstr.data(), nullptr);
+                self->port_, lst);
+            avahi_string_list_free(lst);
             if (r < 0) {
                 LOG_WARN("avahi：add_service 失败：%s", avahi_strerror(r));
                 return;
