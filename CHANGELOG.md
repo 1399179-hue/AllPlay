@@ -10,7 +10,7 @@
 ## [v0.3] — 真 iPhone 端到端 · 2026-10-12
 
 **手机是被宿主自己叫来的。** v0.2 证明的是"拿到流能渲染"，这一版证明的是"能主动把真机叫来"：
-宿主发起蓝牙 iAP2 触发 → iPhone 16 经 mDNS 发现本机 → RTSP 协商 → 屏幕流上屏。
+宿主发起蓝牙 iAP2 触发 → iPhone 经 mDNS 发现本机 → RTSP 协商 → 屏幕流上屏。
 **CarPlay 画面出现在 Ubuntu 桌面上，触摸回传可点。**
 
 ![真 iPhone 的 CarPlay 界面渲染在 Ubuntu 桌面上](docs/images/carplay-home.jpg)
@@ -86,7 +86,7 @@
 - `platform/posix/bt_bluez.cpp`：BlueZ 传输层，客户端模式（我们主动连手机的 iAP2 SPP 服务）。
   链路：SDP 查到 `00000000-deca-fade-deca-deafdecacafe` → **RFCOMM 通道 1** → 连上 →
   iAP2 识别 → 收到手机主动发来的 `0xAA00 请求证书`。
-  真机（iPhone 16）验证到此为止，再往后需要 MFi 身份。
+  真机（iPhone）验证到此为止，再往后需要 MFi 身份。
 
 **验收工具**
 - `tools/fake_phone`：假 iPhone。真 socket 跑完 RTSP + pair-setup/verify + ControlCipher 加密
