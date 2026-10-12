@@ -98,6 +98,7 @@ if(NOT WIN32)
     if(SDL2_FOUND AND SDL2TTF_FOUND)
         add_executable(allplay_host
             host/main.cpp
+            host/bt_task.cpp
             host/statusbar.cpp
             host/launcher.cpp
         )

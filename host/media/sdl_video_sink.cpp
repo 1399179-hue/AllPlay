@@ -107,6 +107,22 @@ void SdlVideoSink::reset()
     }
 }
 
+void SdlVideoSink::dropFrame()
+{
+    // 只在主线程调（tex_/sws_ 是主线程独占的，见头文件里的线程约定）。
+    if (tex_) {
+        SDL_DestroyTexture(tex_);
+        tex_ = nullptr;
+    }
+    texW_ = texH_ = 0;
+    std::lock_guard<std::mutex> lk(mu_);
+    while (!queue_.empty()) {
+        av_frame_free(&queue_.front());
+        queue_.pop_front();
+    }
+    srcW_ = srcH_ = 0;   // 下一场会话由 configure()/feedAnnexB() 重新填
+}
+
 bool SdlVideoSink::configured() const
 {
     std::lock_guard<std::mutex> lk(mu_);

@@ -15,6 +15,7 @@
 //   未连接 = 启动页铺满整窗（白底 + 蓝牙水纹 + 双色 logo + 状态文字）
 //   连接后 = 视频铺满整窗（letterbox），状态栏改为 --statusbar 显式开启的调试叠加
 #include "appstate.h"
+#include "bt_task.h"
 #include "launcher.h"
 #include "screenshot.h"
 #include "statusbar.h"
@@ -60,6 +61,14 @@ struct Options {
     bool        noVideo   = false;
     bool        noAudio   = false;
     std::string dump;                // --dump：退出前把最后一帧存成 PPM
+    // —— 蓝牙触发（--bt 才启用；不加就维持纯接收端，行为与之前完全一致）——
+    bool        btOn     = false;
+    std::string btAddr;                 // --bt-addr：按地址直连，空则按名字找
+    std::string btDevice = "iPhone";    // --bt-device：名字包含匹配
+    bool        btServer = false;       // --bt-mode：默认 client（Linux/macOS 真机可用的是它）
+    std::string btSsid;                 // --ssid：空则取当前连接的 SSID
+    std::string btPass;                 // --wifi-pass：0x5703 里发给手机的 Wi-Fi 密码
+    int         btRetry  = 10;          // --bt-retry：整链重试次数
     // --inject-touch U,V：连上后往 SDL 事件队列塞一对按下/抬起，坐标按**视频矩形**归一化。
     // 无头（SDL_VIDEODRIVER=dummy）时没有任何真实输入，这是唯一能自动验触摸链路的办法。
     float       injectU   = -1.f;
@@ -88,9 +97,17 @@ void printUsage(const char* argv0)
         "  --dump PATH       退出前把最后一帧画面存成 PPM（无人值守时校验界面）\n"
         "  --inject-touch U,V 连上后自动注入一次触摸（U/V 按视频矩形归一化 0..1）——\n"
         "                    无头验证触摸链路用，配 tools/fake_phone 看它打印的坐标\n"
+        "  --bt              启动后主动触发 iPhone（蓝牙 iAP2 → 0x4301），再把画面投出来\n"
+        "  --bt-addr A:B:C:D:E:F  按蓝牙地址直连（比按名字可靠，跳过名字匹配）\n"
+        "  --bt-device NAME   要触发的设备名（包含匹配，默认 iPhone）\n"
+        "  --bt-mode client|server  默认 client（Linux/macOS 上真机可用的是 client：我们主动\n"
+        "                    连手机的 iAP2 SPP 服务；server 是注册 SDP 等手机连）\n"
+        "  --ssid S           告诉手机的 Wi-Fi 名（默认取本机当前连接的那个）\n"
+        "  --wifi-pass P      告诉手机的 Wi-Fi 密码（iAP2 0x5703）\n"
+        "  --bt-retry N       触发失败的整链重试次数（默认 10，每次间隔 3 秒）\n"
         "  -h, --help        显示本帮助\n"
         "\n"
-        "退出：窗口关闭 / ESC / Ctrl-C。\n",
+        "退出：窗口关闭 / ESC / Ctrl-C。开了 --bt 时，运行时按 B 可重新触发一次。\n",
         argv0);
 }
 
@@ -147,6 +164,26 @@ bool parseArgs(int argc, char** argv, Options* o)
             o->noAudio = true;
         } else if (!std::strcmp(a, "--dump")) {
             o->dump = need(a);
+        } else if (!std::strcmp(a, "--bt")) {
+            o->btOn = true;
+        } else if (!std::strcmp(a, "--bt-addr")) {
+            o->btAddr = need(a);
+        } else if (!std::strcmp(a, "--bt-device")) {
+            o->btDevice = need(a);
+        } else if (!std::strcmp(a, "--bt-mode")) {
+            const char* v = need(a);
+            if (!std::strcmp(v, "client"))      o->btServer = false;
+            else if (!std::strcmp(v, "server")) o->btServer = true;
+            else {
+                std::fprintf(stderr, "--bt-mode 只认 client / server\n");
+                return false;
+            }
+        } else if (!std::strcmp(a, "--ssid")) {
+            o->btSsid = need(a);
+        } else if (!std::strcmp(a, "--wifi-pass")) {
+            o->btPass = need(a);
+        } else if (!std::strcmp(a, "--bt-retry")) {
+            o->btRetry = std::atoi(need(a));
         } else if (!std::strcmp(a, "--inject-touch")) {
             const char* v = need(a);
             if (std::sscanf(v, "%f,%f", &o->injectU, &o->injectV) != 2 ||
@@ -178,6 +215,7 @@ public:
                 if (e.button.which == SDL_TOUCH_MOUSEID) break;   // 触屏合成的鼠标事件，忽略
                 if (e.button.button != SDL_BUTTON_LEFT) break;
                 slots_[0].down = true;
+                slots_[0].used = true;
                 slots_[0].x = float(e.button.x);
                 slots_[0].y = float(e.button.y);
                 dirty_ = true;
@@ -191,6 +229,7 @@ public:
             case SDL_MOUSEMOTION:
                 if (e.motion.which == SDL_TOUCH_MOUSEID) break;
                 if (!slots_[0].down) break;
+                slots_[0].used = true;
                 slots_[0].x = float(e.motion.x);
                 slots_[0].y = float(e.motion.y);
                 dirty_ = true;
@@ -202,6 +241,7 @@ public:
                 const int i = fingerSlot(e.tfinger.fingerId);
                 if (i < 0) break;   // 已经 2 个触点了，多的忽略
                 slots_[i].down = (e.type != SDL_FINGERUP);
+                slots_[i].used = true;
                 slots_[i].x = e.tfinger.x * float(winW);
                 slots_[i].y = e.tfinger.y * float(winH);
                 dirty_ = true;
@@ -229,13 +269,17 @@ public:
 
         std::vector<core::airplay::TouchPoint> pts(2);
         for (int i = 0; i < 2; ++i) {
-            if (!slots_[i].down || rect.w <= 0 || rect.h <= 0) continue;
+            // 抬起的那一帧也必须带上**最后的位置**，不能只发 down=false 把坐标留成 (0,0)。
+            // 否则手机看到的是"在图标处按下 → 在左上角抬起"，那是一次滑动而不是点击，
+            // 结果就是点图标毫无反应 —— 而拖地图照常有效（拖动效果早就发生了，看不出差别）。
+            // 安卓那边 ACTION_UP 时 getX() 返回的就是最后位置（MainActivity.kt:222），这里对齐它。
+            if (!slots_[i].used || rect.w <= 0 || rect.h <= 0) continue;
             const float u = (slots_[i].x - float(rect.x)) / float(rect.w);
             const float v = (slots_[i].y - float(rect.y)) / float(rect.h);
             if (u < 0.f || u > 1.f || v < 0.f || v > 1.f) continue;   // 黑边上，忽略
             pts[i].x = u;
             pts[i].y = v;
-            pts[i].down = true;
+            pts[i].down = slots_[i].down;
         }
         rx.sendTouch(pts);
     }
@@ -247,7 +291,9 @@ public:
     }
 
 private:
-    struct Slot { bool down = false; float x = 0, y = 0; SDL_FingerID id = -1; };
+    /// used = 这个 slot 被用过（按下过 / 移动过）。抬起后坐标要继续上报，所以
+    /// 判断"这个 slot 要不要参与本次上报"不能用 down —— down 一清零就什么都不发了。
+    struct Slot { bool down = false, used = false; float x = 0, y = 0; SDL_FingerID id = -1; };
 
     /// 已有该手指 → 原 slot；否则找空位（鼠标占着 0 时从 1 开始找）
     int fingerSlot(SDL_FingerID id)
@@ -290,9 +336,15 @@ int main(int argc, char** argv)
 
     Uint32 winFlags = SDL_WINDOW_RESIZABLE;
     if (opt.fullscreen) winFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    // 状态栏画在 y = opt.screenH 处（见 StatusBar::draw 用的 y_，以及下面的 bar.init），
+    // 所以窗口必须比视频面**高出这一条**。只给 screenH 会同时出两个毛病：
+    //   ① 状态栏整个落在窗口下沿之外，根本看不见；
+    //   ② 渲染循环仍按 areaH = winH - barH 排视频，16:9 的画面被缩进 1280x(screenH-barH)，
+    //      左右各多出一条黑边 —— 就是"开了 --statusbar 就有黑边"。
+    const int winPxH = opt.screenH + (opt.barOn ? opt.barH : 0);
     SDL_Window* win = SDL_CreateWindow(
         "AllPlay", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        opt.screenW, opt.screenH, winFlags);
+        opt.screenW, winPxH, winFlags);
     if (!win) {
         std::fprintf(stderr, "[host] 建窗口失败：%s\n", SDL_GetError());
         SDL_Quit();
@@ -368,6 +420,27 @@ int main(int argc, char** argv)
     std::printf("[host] READY —— 等 iPhone 连接（假手机：tools/fake_phone）\n");
     std::fflush(stdout);
 
+    // —— 蓝牙触发（--bt）——
+    // 必须放在 rx.start() 之后：触发参数要用 rx.ip()/port()/info()，它们启动完才有效。
+    // 触发本身跑在 BtTask 自己的线程上（runBtTrigger 是全阻塞的，放主线程会冻住画面）。
+    allplay::BtTask        btTask;
+    allplay::BtTaskOptions btOpt;
+    btOpt.name          = opt.name;
+    btOpt.deviceName    = opt.btDevice;
+    btOpt.deviceAddress = opt.btAddr;
+    btOpt.serverMode    = opt.btServer;
+    btOpt.ssid          = opt.btSsid;
+    btOpt.passphrase    = opt.btPass;
+    btOpt.identityDir   = opt.identityDir;
+    btOpt.retry         = opt.btRetry;
+    auto btLog = [](const std::string& s) {
+        std::printf("[bt] %s\n", s.c_str());
+        std::fflush(stdout);
+    };
+    if (opt.btOn && !btTask.start(rx, btOpt, btLog)) {
+        std::fprintf(stderr, "[host] 蓝牙触发没能启动\n");
+    }
+
     TouchPad pad;
 
     bool     running   = true;
@@ -382,6 +455,16 @@ int main(int argc, char** argv)
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_b && opt.btOn) {
+                // 触发失败、或手机掉线之后，不用重启程序
+                if (btTask.start(rx, btOpt, btLog)) {
+                    std::printf("[host] 重新触发蓝牙…\n");
+                    std::fflush(stdout);
+                } else {
+                    std::printf("[host] 上一次触发还在跑，稍候再按 B\n");
+                    std::fflush(stdout);
+                }
+            }
             else pad.handle(e, opt.screenW, opt.screenH);
         }
 
@@ -411,6 +494,12 @@ int main(int argc, char** argv)
             if (streaming && opt.fullscreen) {
                 SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
             }
+#ifdef ALLPLAY_HAVE_FFMPEG
+            // 会话结束必须把末帧丢掉：sink 会一直重画纹理里那一帧
+            // （"画面停住而不是消失"是为会话中途掉帧设计的），
+            // 留着它就让上面那句"回启动页"变成谎话——画面卡死在最后一帧。
+            if (!streaming) videoSink.dropFrame();
+#endif
         }
 
         int winW = 0, winH = 0;
@@ -498,6 +587,7 @@ int main(int argc, char** argv)
 
     std::printf("[host] 收尾：停核心…\n");
     std::fflush(stdout);
+    btTask.stop();      // 触发线程 detach 掉（runBtTrigger 没有取消点，见 host/bt_task.cpp）
     rx.stop();          // 先停核心（join 屏幕流/音频流线程），再让 sink 析构
 #ifdef ALLPLAY_HAVE_FFMPEG
     // 音频不做"有没有声音"的自动判定（无头跑时设备是 dummy，听不见）；

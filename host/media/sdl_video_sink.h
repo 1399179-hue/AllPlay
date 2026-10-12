@@ -62,6 +62,11 @@ public:
     /// 是否有过至少一帧（决定要不要切成视频面）
     bool hasFrame() const { return tex_ != nullptr; }
 
+    /// 丢掉当前这一帧（**只在主线程调**）。会话结束时回启动页要用：
+    /// 否则纹理里那张末帧会被 present() 一直重画，屏上卡着最后一帧回不去
+    /// ——日志里明明打了"回启动页"，画面却纹丝不动。
+    void dropFrame();
+
     /// 视频固有尺寸（0 = 还没解出过帧）。主线程读，用于算 letterbox。
     void intrinsicSize(int* w, int* h) const;
 

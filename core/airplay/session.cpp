@@ -373,10 +373,20 @@ RtspResponse Session::handleSetup(const RtspRequest& req)
 
             if (type == 110 || type == 111) {
                 // 屏幕流（TCP dataPort）
-                if (!services_ || !services_->makeTcpListener || !video_ || shared_.empty()) continue;
+                // 这两种跳过都别静默：手机拿不到 dataPort 只会闷头等十几秒然后断开，
+                // 日志里就剩一句"SETUP 完就断线"，极难定位（真机上踩过一次）。
+                if (!video_) {
+                    LOG_WARN("SETUP 要屏幕流，但本进程没接 IVideoOutput —— 屏幕流不建，"
+                             "手机拿不到 dataPort 将会超时断开");
+                    continue;
+                }
+                if (!services_ || !services_->makeTcpListener || shared_.empty()) continue;
                 auto listener = services_->makeTcpListener();
                 std::string lerr;
-                if (!listener || !listener->start("", 0, &lerr)) continue;
+                if (!listener || !listener->start("", 0, &lerr)) {
+                    LOG_WARN("屏幕流的监听端口起不来：%s", lerr.c_str());
+                    continue;
+                }
                 const uint16_t port = listener->port();
                 streams_.push_back(std::make_unique<ScreenStream>(
                     std::move(listener), shared_, std::to_string(scid), width_, height_, video_,
