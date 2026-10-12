@@ -4,7 +4,7 @@
 #   core/           平台无关协议核心（唯一三方依赖 = OpenSSL）
 #   platform/posix  Linux+macOS 适配（socket/avahi·dns_sd/bluez·IOBluetooth）
 #   platform/windows Windows 适配（Winsock2，待做；当前只构建 core + 自测）
-#   host/           桌面开发宿主（SDL2，仅开发验收用；可缺省跳过）
+#   host/           桌面宿主（SDL2；缺 SDL2 时可缺省跳过）
 # 本文件随里程碑逐步长出 target。
 cmake_minimum_required(VERSION 3.16)
 project(AllPlay LANGUAGES C CXX)

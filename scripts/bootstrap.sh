@@ -39,6 +39,6 @@ fi
 
 echo
 echo "== 完成。下一步 =="
-echo "  1) 准备 MFi 身份：identity/identity.pk8 + identity/certificate.p7b（见 docs/README.md）"
-echo "  2) scripts/build.sh              # 构建"
-echo "  3) scripts/run.sh --help"
+echo "  1) 准备 MFi 身份：identity/identity.pk8 + identity/certificate.p7b（见 README.md）"
+echo "  2) bash scripts/build.sh         # 构建（脚本没有执行位，要写 bash）"
+echo "  3) bash scripts/run.sh --help"

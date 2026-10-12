@@ -9,8 +9,10 @@
 // ============================================================================
 // core 只把"解好码的 AnnexB 帧"喂给这个接口，具体怎么解码/渲染由平台决定：
 //   Android = MediaCodec → SurfaceView（硬件解码，csd 用 avcC/hvcC）
-//   桌面    = ffmpeg 解码 → SDL 纹理（仅开发验收用）
-// 音频（IAudioOutput）属 M4+，本轮只有空桩。
+//   桌面    = ffmpeg 解码 → SDL 纹理
+//
+// ⚠️ 线程：configure()/feedAnnexB() 来自 ScreenStream 线程，而 reset() 来自 RTSP 线程
+//    （/command forceKeyFrame）。实现必须自己加锁，core 不管 —— 详见 docs/architecture.md。
 #pragma once
 
 #include <cstddef>
