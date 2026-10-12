@@ -29,7 +29,7 @@
 | 平台 | 视频上屏 | 音频 | 蓝牙触发 | 状态 |
 |---|---|---|---|---|
 | **Android** | MediaCodec 硬解 → Surface | AudioTrack | `BluetoothSocket`（JNI） | ✅ 端到端跑通 |
-| **Linux / Ubuntu** | ffmpeg 软解 → SDL2 纹理 | SDL2（AAC-LC / Opus / LPCM） | BlueZ：SDP + 裸 RFCOMM（客户端模式） | ✅ 端到端跑通 |
+| **Linux / Ubuntu** | ffmpeg 软解 → SDL2 纹理 | SDL2（AAC-LC / Opus / LPCM） | BlueZ：SDP + 裸 RFCOMM（客户端模式） | ✅ **真 iPhone 端到端跑通** |
 | **macOS** | 同 Linux（**共用同一份宿主代码**） | 同 Linux | IOBluetooth | ⏳ 宿主可跑，蓝牙未真机验收 |
 | **Windows** | ffmpeg（待接） | — | `AF_BTH`（待接入） | ⏳ 骨架 |
 
@@ -146,11 +146,22 @@ bash scripts/build.sh          # 产物在 build/
 
 > **`scripts/*.sh` 在仓库里没有执行位**，所以要写 `bash scripts/xxx.sh`，直接 `./scripts/build.sh` 会 permission denied。
 
-启动宿主（连真 iPhone）：
+启动宿主。两种用法：
 
 ```bash
+# ① 等手机来连（传统接收端）
 ./build/allplay_host --name "AllPlay"
+
+# ② 主动把手机叫来（蓝牙 iAP2 触发 → 再接住它投过来的画面）
+./build/allplay_host --statusbar \
+  --bt --bt-device iPhone --ssid "<你的 Wi-Fi 名>" --wifi-pass "<密码>"
 ```
+
+- `--bt` 系列开关**一律 opt-in**，不加就跟纯接收端的行为完全一致。
+- 用 `--bt-addr AA:BB:CC:DD:EE:FF` 按蓝牙地址直连，比按名字匹配可靠。
+- 触发失败会按 3 秒间隔整链重试（`--bt-retry`，默认 10 次）；运行时按 `B` 可再触发一次。
+- **同网段若还有别的 CarPlay 接收端**（自带 MFi 的车机等），iPhone 有自动回连行为，
+  可能连到它那边去 —— 测本机时建议先把那台断电。
 
 ### 端到端验收（**不需要 iPhone**）
 
@@ -187,13 +198,16 @@ cd android && ./gradlew :app:assembleDebug      # 需要 Android SDK + NDK + 为
 |---|---|---|
 | M0 | 骨架：CMake + SDL 窗口/状态栏 + 脚本 | ✅ |
 | M1 | core：RTSP + `/info`(bplist) + mDNS 广播 `_airplay._tcp` | ✅ |
-| M2 | 蓝牙触发：iAP2 协议栈（识别 / MFi / 订阅 / 0x5703 / 0x4301） | ✅ 软件完成；Linux BlueZ 已接通真机（iPhone 16，走到手机主动发 `0xAA00 请求证书`）。⏳ 再往后需要 **MFi 身份** |
-| M3 | 会话 + 视频：pair-setup/verify、auth-setup、SETUP、ControlCipher、屏幕流 | ✅ 安卓端到端；✅ 桌面 ffmpeg 解码上屏 |
+| M2 | 蓝牙触发：iAP2 协议栈（识别 / MFi / 订阅 / 0x5703 / 0x4301） | ✅ 软件完成；**Linux BlueZ 接通真机 iPhone，整链走到 `0x4301 CarPlayStartSession`** |
+| M3 | 会话 + 视频：pair-setup/verify、auth-setup、SETUP、ControlCipher、屏幕流 | ✅ 安卓端到端；✅ 桌面 ffmpeg 解码上屏；✅ **真 iPhone 在 Ubuntu 桌面上跑通（2026-10-12）** |
 | M4 | 状态栏信息 + 健壮性（重连 / 关键帧恢复 / watchdog） | 部分（关键帧恢复已接） |
 | M5 | UI 状态页 / 叠加（原生） | |
 
-> **当前唯一的硬阻塞是 MFi 身份**，不是代码问题。没有它，真 iPhone 会在 iAP2 的
-> `0xAA00 请求证书` 之后拒绝握手。桌面端到端之所以能跑通，是因为假手机跳过了这一步。
+> **代码侧已经没有硬阻塞了。** 2026-10-12，真 iPhone 在 Ubuntu 桌面上跑通了全链路
+> —— 蓝牙触发 → mDNS 发现 → RTSP 协商 → 屏幕流上屏 → 触摸可点，
+> 截图见 [`CHANGELOG.md`](CHANGELOG.md) 的 v0.3。
+> 剩下的阻塞在**凭证**上：iAP2 的 `0xAA00 请求证书` 要求 Apple MFi 计划签发的配件身份
+> （`identity/`）。开发期用自备身份即可走通全链路做验证，但**纯软件身份不是产品路径**。
 
 版本历史见 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -221,9 +235,10 @@ platform/
   windows/       Winsock2 / AF_BTH
 android/         Android 工程（Gradle：Kotlin + NDK C++ core + JNI → 系统 API）
 host/            桌面宿主（SDL2 / ffmpeg）
+  bt_task          蓝牙触发任务（--bt：主动把手机叫起来）
   media/           ffmpeg 软解 + SDL 视频/音频 sink
 tools/           自测与验收工具（core_selftest / iap2_test / m3_test / fake_phone / video_probe）
-docs/            架构说明与协议笔记
+docs/            架构说明 · 协议笔记 · 截图（images/）
 scripts/         bootstrap / build / deploy / 检查脚本
 ```
 
@@ -259,5 +274,10 @@ scripts/         bootstrap / build / deploy / 检查脚本
   有画面说明是协议侧的问题，没画面是解码侧的问题。
 - **`:7000` 起不来**：macOS 的 `ControlCenter`（隔空播放接收器）常年占着 7000，
   宿主会静默改用 7001，而假手机默认连 7000 → **两边都显式 `--port 7100`**。
+- **手机压根不来连**（日志里一行 RTSP 都没有 —— 注意区别于"连上又断"）：先查 mDNS 的 TXT 记录
+  是不是真的键值 —— `avahi-browse -t -r -p _airplay._tcp | grep -i allplay`，应看到
+  `deviceid=` / `features=` / `flags=0x4` / `srcvers=` / `pi=`。iPhone 靠这些字段认接收端，
+  缺了就不连。对照：同网段的 Mac 广播的是 `flags=0x204`，CarPlay 接收端才是 `flags=0x4`。
 - **看状态栏**：宿主加 `--statusbar`，左下状态点 = 状态（灰=空闲、黄=等配对、绿=视频流、红=错误），
-  右侧 = 分辨率 / fps / 帧数 / 音频欠载次数。
+  右侧 = 分辨率 / fps / 帧数 / 音频欠载次数。**静态页面下 fps 掉到 0 是正常的** ——
+  AirPlay 屏幕流是画面变了才发帧，不是卡死。
