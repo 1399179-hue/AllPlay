@@ -81,8 +81,11 @@ int main(int argc, char** argv)
             std::fprintf(stderr,
                          "用法: %s [--port N] [--ifname X] [--name S] [--screen WxH]\n"
                          "        [--state-dir DIR] [--no-avahi] [--duration S]\n"
-                         "        [--bt] [--bt-device 名字] [--bt-addr AA-BB-..]\n"
-                         "        [--ssid WiFi名] [--wifi-pass 密码] [--identity 目录]\n", argv[0]);
+                         "        [--bt] [--bt-mode server|client] [--bt-device 名字]\n"
+                         "        [--bt-addr AA-BB-..]\n"
+                         "        [--ssid WiFi名] [--wifi-pass 密码] [--identity 目录]\n"
+                         "  --bt-mode 默认 server；Linux/macOS 上真机可用的都是 **client**\n"
+                         "            （我们主动连手机的 iAP2 SPP 服务）\n", argv[0]);
             return 2;
         }
     }

@@ -55,7 +55,11 @@ if(NOT WIN32)
         set(POSIX_BT_SRC   platform/posix/bt_bluez.cpp)
         set(POSIX_FRAMEWORKS "")
         pkg_check_modules(AVAHI_CLIENT REQUIRED IMPORTED_TARGET avahi-client)
-        message(STATUS "蓝牙传输: 桩 (Linux，BlueZ 待做)")
+        # BlueZ 传输层：libbluetooth 出 SDP 查询 + 裸 RFCOMM socket + HCI 取本机地址；
+        # libdbus-1 用来枚举已配对设备（org.bluez）与当前 SSID（NetworkManager）。
+        pkg_check_modules(BLUEZ REQUIRED IMPORTED_TARGET bluez)
+        pkg_check_modules(DBUS1 REQUIRED IMPORTED_TARGET dbus-1)
+        message(STATUS "蓝牙传输: BlueZ (Linux，libbluetooth ${BLUEZ_VERSION})")
     endif()
 
     add_library(allplay_posix STATIC
@@ -68,7 +72,8 @@ if(NOT WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/platform)
     target_link_libraries(allplay_posix PUBLIC allplay_core ${POSIX_FRAMEWORKS})
     if(NOT APPLE)
-        target_link_libraries(allplay_posix PUBLIC PkgConfig::AVAHI_CLIENT)
+        target_link_libraries(allplay_posix PUBLIC
+            PkgConfig::AVAHI_CLIENT PkgConfig::BLUEZ PkgConfig::DBUS1)
     endif()
     target_compile_options(allplay_posix PRIVATE -Wall -Wextra)
 
