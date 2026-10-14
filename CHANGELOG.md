@@ -7,6 +7,42 @@
 
 ---
 
+## [v0.4] — Android 4.4（API 19）· 2026-10-14
+
+安卓端降到 **Android 4.4（API 19）**，在 32 位 Amlogic S905M 电视盒子上真机跑通
+（蓝牙 iAP2 触发 → mDNS 发现 → RTSP 协商 → 720p 投屏 → 音频）。意义：**最弱的安卓盒子也能当 CarPlay 屏。**
+
+### 新增
+
+- **Android 4.4 移植**：`minSdk 28→19`。Kotlin 层把 NotificationChannel / AudioAttributes+AudioFormat.Builder /
+  MediaCodec buffer 访问 / setOutputSurface / startLocalOnlyHotspot / startForegroundService /
+  运行时权限 / 电池优化 / 对话框主题 / letterSpacing 等 20 多处 API 26+ 调用全部加 `SDK_INT` 守卫；
+  新增 `MediaCodecCompat`（旧数组式 buffer 访问，API 19 用 `getInputBuffers()`）。
+- **原生层 API 19 兼容**：`cpp/CMakeLists` 启用 C++17；`net_posix` 用 SIOCGIFCONF 替代
+  API 24 才有的 `getifaddrs`；新增 `stdio_compat` 提供 API<23 缺失的 `stdin/stdout/stderr` 符号；
+  `log.cpp` 安卓上只走 logcat（不引 stderr）。
+- **双 ABI + 降 NDK**：`abiFilters` 加 `armeabi-v7a`（32 位盒子），OpenSSL 按 ABI 分目录交叉编译；
+  NDK 降至 r25c（r26 起不支持 API 19）。
+
+### 修复
+
+- **mDNS 在安卓盒子上广播失败**：JmDNS 抢不到 5353（被系统 netd 占用，EADDRINUSE），退回系统 NsdManager。
+  API 19 上不设 TXT —— `setTxtRecord(byte[])` 不存在、`setTxtRecord(DnsSdTxtRecord)` 会导致
+  NsdServiceInfo Binder 序列化失败；实测 iPhone 靠蓝牙 0x4301 + RTSP `/info` 就能连，TXT 非必需。
+- **性能模式改为固定 1280x720@30fps**（原先是"分辨率减半"）。
+- **断开后不自动重连**：AirPlay 会话断开后，蓝牙触发改为关旧 RFCOMM 再重发 0x4301
+  （iPhone 的 iAP2 SPP 服务只接受一条连接，旧的不关新的连不上）。
+
+### 已知限制
+
+- 手动断开 iPhone 的 WiFi 后，iOS 会主动退出 CarPlay，盒子无法强制重进 —— iOS 行为，
+  真实场景（WiFi 因干扰短暂掉线）不受影响。
+- 盒子的系统热点（SoftAP）被 Amlogic 框架锁定为"仅系统包可调"（`setWifiApEnabled`
+  抛 `SecurityException: Package android does not belong to ...`），App 内反射开热点不可用；
+  需同 WiFi 或外部方式开热点。
+
+---
+
 ## [v0.3] — 真 iPhone 端到端 · 2026-10-12
 
 **手机是被宿主自己叫来的。** v0.2 证明的是"拿到流能渲染"，这一版证明的是"能主动把真机叫来"：
