@@ -27,7 +27,8 @@ class HotspotManager(context: Context) {
     private val wifiManager: WifiManager =
         context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
     private val filesDir = context.filesDir
-    private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
+    // LocalOnlyHotspotReservation 是 API 26；用 Any? 避免 4.4 加载类时引用不存在的类型
+    private var reservation: Any? = null
 
     /// 开热点（阻塞到就绪/失败）。优先持久 SoftAP，失败退 LocalOnlyHotspot。
     @SuppressLint("MissingPermission")
@@ -87,14 +88,16 @@ class HotspotManager(context: Context) {
             )
             m.invoke(wifiManager, cfg, true) as Boolean
         } catch (e: Exception) {
-            Log.w("AllPlay", "setWifiApEnabled 反射失败：${e.message}")
+            val c = e.cause ?: e
+            Log.w("AllPlay", "setWifiApEnabled 反射失败：${c.javaClass.name}: ${c.message}", c)
             false
         }
     }
 
-    /// 兜底：LocalOnlyHotspot（前台可用，退后台会被系统回收）
+    /// 兜底：LocalOnlyHotspot（前台可用，退后台会被系统回收）。API 26 才有，4.4 直接失败。
     @SuppressLint("MissingPermission")
     private fun startLocalOnly(timeoutMs: Long): Boolean {
+        if (Build.VERSION.SDK_INT < 26) return false
         val latch = CountDownLatch(1)
         var ok = false
         val handler = Handler(Looper.getMainLooper())
@@ -118,7 +121,10 @@ class HotspotManager(context: Context) {
     }
 
     fun stop() {
-        try { reservation?.close() } catch (_: Exception) {}
+        // reservation 是 API 26 的 LocalOnlyHotspotReservation；用反射 close() 避免 4.4 引用缺失类
+        try {
+            reservation?.let { r -> r.javaClass.getMethod("close").invoke(r) }
+        } catch (_: Exception) {}
         reservation = null
         // 持久 SoftAP 不关：退后台/重建服务都保持热点（CarPlay 常驻）
     }

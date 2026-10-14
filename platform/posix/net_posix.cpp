@@ -26,6 +26,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <vector>
 
 namespace allplay::posix {
 
@@ -239,50 +240,94 @@ private:
 // ---------------------------------------------------------------------------
 // 网卡信息
 // ---------------------------------------------------------------------------
-std::string ipv4Of(struct ifaddrs* ifa)
+namespace {
+
+struct IfInfo {
+    std::string        name;
+    unsigned int       flags = 0;
+    struct sockaddr_in addr {};
+};
+
+std::string ipv4String(const struct sockaddr_in& sin)
 {
-    auto* sa = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
-    char  buf[INET_ADDRSTRLEN] = "";
-    if (!inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof buf)) return {};
+    char buf[INET_ADDRSTRLEN] = "";
+    if (!inet_ntop(AF_INET, &sin.sin_addr, buf, sizeof buf)) return {};
     return buf;
 }
+
+// 枚举所有 IPv4 网卡。桌面/Linux 用 getifaddrs；Android 4.4（API<24）没有
+// getifaddrs/freeifaddrs，改用 SIOCGIFCONF（AF_INET socket 下每条目固定大小）。
+bool enumerateIPv4(std::vector<IfInfo>* out)
+{
+    out->clear();
+#if defined(__ANDROID__) && __ANDROID_API__ < 24
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+
+    struct ifconf ifc {};
+    ifc.ifc_len = 0;
+    if (::ioctl(fd, SIOCGIFCONF, &ifc) < 0) { ::close(fd); return false; }
+    if (ifc.ifc_len <= 0) { ::close(fd); return true; }
+    std::vector<char> buf(size_t(ifc.ifc_len) + 2 * sizeof(struct ifreq));
+    ifc.ifc_buf = buf.data();
+    if (::ioctl(fd, SIOCGIFCONF, &ifc) < 0) { ::close(fd); return false; }
+
+    for (char* p = buf.data(); p < buf.data() + ifc.ifc_len; p += sizeof(struct ifreq)) {
+        auto* ifr = reinterpret_cast<struct ifreq*>(p);
+        IfInfo info;
+        info.name = ifr->ifr_name;
+        info.addr = *reinterpret_cast<struct sockaddr_in*>(&ifr->ifr_addr);
+        struct ifreq fr {};
+        std::strncpy(fr.ifr_name, ifr->ifr_name, sizeof fr.ifr_name - 1);
+        if (::ioctl(fd, SIOCGIFFLAGS, &fr) == 0) info.flags = unsigned(fr.ifr_flags);
+        out->push_back(std::move(info));
+    }
+    ::close(fd);
+    return true;
+#else
+    struct ifaddrs* head = nullptr;
+    if (getifaddrs(&head) != 0) return false;
+    for (struct ifaddrs* ifa = head; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        IfInfo info;
+        info.name  = ifa->ifa_name;
+        info.flags = ifa->ifa_flags;
+        info.addr  = *reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        out->push_back(std::move(info));
+    }
+    freeifaddrs(head);
+    return true;
+#endif
+}
+
+}  // namespace
 
 class PosixNetworkInfo : public core::INetworkInfo {
 public:
     std::string pickInterfaceIPv4(std::string* ifnameOut) override
     {
         if (ifnameOut) ifnameOut->clear();
-        struct ifaddrs* head = nullptr;
-        if (getifaddrs(&head) != 0) return {};
-
-        std::string bestIp, bestName;
-        for (struct ifaddrs* ifa = head; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-            if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
-            std::string ip = ipv4Of(ifa);
+        std::vector<IfInfo> list;
+        if (!enumerateIPv4(&list)) return {};
+        for (auto& ifa : list) {
+            if (!(ifa.flags & IFF_UP) || (ifa.flags & IFF_LOOPBACK)) continue;
+            std::string ip = ipv4String(ifa.addr);
             if (ip.empty()) continue;
-            bestIp = ip;
-            bestName = ifa->ifa_name;
-            break;   // 第一个够（lo 已排除；多网卡用 --ifname 显式指定）
+            if (ifnameOut) *ifnameOut = ifa.name;
+            return ip;   // 第一个够（lo 已排除；多网卡用 --ifname 显式指定）
         }
-        freeifaddrs(head);
-        if (ifnameOut) *ifnameOut = bestName;
-        return bestIp;
+        return {};
     }
 
     std::string interfaceIPv4(const std::string& ifname) override
     {
-        struct ifaddrs* head = nullptr;
-        if (getifaddrs(&head) != 0) return {};
-        std::string out;
-        for (struct ifaddrs* ifa = head; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-            if (ifname != ifa->ifa_name) continue;
-            out = ipv4Of(ifa);
-            break;
+        std::vector<IfInfo> list;
+        if (!enumerateIPv4(&list)) return {};
+        for (auto& ifa : list) {
+            if (ifname != ifa.name) continue;
+            return ipv4String(ifa.addr);
         }
-        freeifaddrs(head);
-        return out;
+        return {};
     }
 
     bool interfaceMAC(const std::string& ifname, uint8_t mac[6]) override
@@ -304,31 +349,32 @@ public:
         freeifaddrs(head);
         return ok;
 #else
+        // 有 getifaddrs 时先试 AF_PACKET；Android 4.4（API<24）没有 getifaddrs，直接走 SIOCGIFHWADDR。
+#if !(defined(__ANDROID__) && __ANDROID_API__ < 24)
         struct ifaddrs* head = nullptr;
-        if (getifaddrs(&head) != 0) return false;
-        bool ok = false;
-        for (struct ifaddrs* ifa = head; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_PACKET) continue;
-            if (ifname != ifa->ifa_name) continue;
-            auto* ll = reinterpret_cast<struct sockaddr_ll*>(ifa->ifa_addr);
-            if (ll->sll_halen == 6) {
-                std::memcpy(mac, ll->sll_addr, 6);
-                ok = true;
+        if (getifaddrs(&head) == 0) {
+            bool ok = false;
+            for (struct ifaddrs* ifa = head; ifa; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_PACKET) continue;
+                if (ifname != ifa->ifa_name) continue;
+                auto* ll = reinterpret_cast<struct sockaddr_ll*>(ifa->ifa_addr);
+                if (ll->sll_halen == 6) {
+                    std::memcpy(mac, ll->sll_addr, 6);
+                    ok = true;
+                }
+                break;
             }
-            break;
+            freeifaddrs(head);
+            if (ok) return true;
         }
-        freeifaddrs(head);
-        if (!ok) {
-            int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-            if (fd < 0) return false;
-            struct ifreq ifr{};
-            std::snprintf(ifr.ifr_name, sizeof ifr.ifr_name, "%s", ifname.c_str());
-            if (::ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
-                std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
-                ok = true;
-            }
-            ::close(fd);
-        }
+#endif
+        int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) return false;
+        struct ifreq ifr {};
+        std::snprintf(ifr.ifr_name, sizeof ifr.ifr_name, "%s", ifname.c_str());
+        bool ok = ::ioctl(fd, SIOCGIFHWADDR, &ifr) == 0;
+        if (ok) std::memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+        ::close(fd);
         return ok;
 #endif
     }

@@ -140,6 +140,8 @@ private:
 // ---------------------------------------------------------------------------
 class JniBluetooth : public core::IBluetooth {
 public:
+    ~JniBluetooth() override { closeStream(); }
+
     std::vector<core::BtDevice> pairedDevices(std::string* err) override
     {
         std::vector<core::BtDevice> out;
@@ -182,7 +184,10 @@ public:
         const jint h = env->CallIntMethod(g_bt, m, newJstr(env, address), newJstr(env, uuid));
         if (attached) g_vm->DetachCurrentThread();
         if (h < 0) { if (err) *err = "connectSpp 失败"; return nullptr; }
-        return new JniByteStream(h);
+        // 关掉上一条 RFCOMM：iPhone 的 iAP2 SPP 服务只接受一条连接，重连前必须先关旧的
+        closeStream();
+        currentStream_ = new JniByteStream(h);
+        return currentStream_;
     }
 
     core::IByteStream* waitForPhoneConnection(int timeoutMs, std::string* err) override
@@ -197,8 +202,18 @@ public:
         const jint h = env->CallIntMethod(g_bt, m, newJstr(env, core::kWirelessIapUuid), jint(timeoutMs));
         if (attached) g_vm->DetachCurrentThread();
         if (h < 0) { if (err) *err = "listenSpp 失败"; return nullptr; }
-        return new JniByteStream(h);
+        closeStream();
+        currentStream_ = new JniByteStream(h);
+        return currentStream_;
     }
+
+private:
+    void closeStream()
+    {
+        if (currentStream_) { delete currentStream_; currentStream_ = nullptr; }
+    }
+
+    core::IByteStream* currentStream_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -441,20 +456,45 @@ Java_com_allplay_app_NativeAllPlay_nativeStart(JNIEnv* env, jobject,
                  c.ipAddresses.empty() ? "?" : c.ipAddresses[0].c_str());
 
             // iPhone 的 iAP2 SPP 服务在蓝牙 ACL 连上后才异步打开，单次 connectSpp 极易太早失败。
-            // 整链重试（枚举→RFCOMM→iAP2→0x4301），直到发出 0x4301 或超时放弃。
+            // 整链重试（枚举→RFCOMM→iAP2→0x4301），直到发出 0x4301。
+            // 发出后等 AirPlay 会话断开（如 iPhone 手动断开 WiFi），断开后重新触发——否则
+            // iPhone 重连 WiFi 后不会自动重进 CarPlay。
             constexpr int kTriggerAttempts = 10;
             constexpr int kRetryDelayMs    = 3000;
-            for (int attempt = 1; attempt <= kTriggerAttempts; ++attempt) {
-                auto r = core::bt::runBtTrigger(s_bt, bp, [](const std::string& s) { LOGI("[bt] %s", s.c_str()); });
-                if (r.ok) {
-                    LOGI("bt trigger 成功（第 %d 次尝试）", attempt);
-                    return;
+            for (;;) {
+                bool triggered = false;
+                for (int attempt = 1; attempt <= kTriggerAttempts; ++attempt) {
+                    auto r = core::bt::runBtTrigger(s_bt, bp, [](const std::string& s) { LOGI("[bt] %s", s.c_str()); });
+                    if (r.ok) {
+                        LOGI("bt trigger 成功（第 %d 次尝试）", attempt);
+                        triggered = true;
+                        break;
+                    }
+                    LOGI("bt trigger 第 %d/%d 次失败：%s", attempt, kTriggerAttempts, r.error.c_str());
+                    if (attempt < kTriggerAttempts)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
                 }
-                LOGI("bt trigger 第 %d/%d 次失败：%s", attempt, kTriggerAttempts, r.error.c_str());
-                if (attempt < kTriggerAttempts)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
+                if (!triggered) {
+                    LOGI("bt trigger 重试 %d 次后仍失败，放弃", kTriggerAttempts);
+                    break;
+                }
+                // 等 AirPlay 会话建立（sessionActive → true），最多 60 秒
+                bool becameActive = false;
+                for (int i = 0; i < 60; ++i) {
+                    if (g_receiver && g_receiver->sessionActive()) { becameActive = true; break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                }
+                if (!becameActive) {
+                    LOGI("AirPlay 会话 60 秒内未建立，重新触发蓝牙");
+                    continue;
+                }
+                // 等 AirPlay 会话断开（sessionActive → false），再重新触发
+                while (g_receiver && g_receiver->sessionActive()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                }
+                LOGI("AirPlay 会话已断开，重新触发蓝牙");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             }
-            LOGI("bt trigger 重试 %d 次后仍失败", kTriggerAttempts);
         }).detach();
     } else {
         LOGI("跳过蓝牙触发（旋转重启）：走 mDNS + carplay-probe 快速重连");
