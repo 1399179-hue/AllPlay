@@ -136,7 +136,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             text = sp
             textSize = 38f
             typeface = Typeface.create("sans-serif", Typeface.BOLD)
-            letterSpacing = 0.04f
+            if (Build.VERSION.SDK_INT >= 21) letterSpacing = 0.04f   // setLetterSpacing 是 API 21
             gravity = Gravity.CENTER
         }
         // 蓝牙水纹徽标：涟漪环 + 蓝色圆底 + 蓝牙图标
@@ -236,6 +236,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun maybeRequestPermissions() {
+        // Android 4.4（<23）：危险权限安装即授予，无运行时权限模型，直接起服务
+        if (Build.VERSION.SDK_INT < 23) {
+            startService()
+            return
+        }
         val perms = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 31) {
             perms += listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
@@ -260,6 +265,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     /// 申请电池优化豁免（退后台不被 Doze 杀进程/断热点；需用户在系统弹窗里点允许）
     private fun requestBatteryExemption() {
+        if (Build.VERSION.SDK_INT < 23) return   // Android 4.4 无电池优化概念
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         if (pm.isIgnoringBatteryOptimizations(packageName)) return
         try {
@@ -268,7 +274,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun startService() {
-        startForegroundService(serviceIntent)
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent)
+        else startService(serviceIntent)   // Android 4.4 无 startForegroundService
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -305,15 +312,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun showSmoothModeDialog() {
         val svc = (application as? AllPlayApp)?.service ?: return
         val active = svc.smoothModeActive
-        val builder = AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert).setCancelable(false)
+        val builder = AlertDialog.Builder(this).setCancelable(false)
         if (active) {
             builder.setTitle("退出流畅模式")
-                .setMessage("当前已是流畅模式（分辨率减半 + 30fps）。\n是否恢复正常分辨率 + 60fps？")
+                .setMessage("当前已是流畅模式（1280x720 + 30fps）。\n是否恢复正常分辨率？")
                 .setPositiveButton("恢复正常") { _, _ -> svc.disableSmoothMode() }
                 .setNegativeButton("保持流畅模式", null)
         } else {
             builder.setTitle("进入流畅模式")
-                .setMessage("分辨率减半 + 最高 30fps，降低解码压力、减少掉帧；图标比例不变。")
+                .setMessage("固定 1280x720 + 最高 30fps，降低解码压力、减少掉帧。")
                 .setPositiveButton("进入流畅模式") { _, _ -> svc.enableSmoothMode() }
                 .setNegativeButton("取消", null)
         }
@@ -367,12 +374,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             setText(if (passFile.exists()) passFile.readText().trim() else "")
         }
         val smoothCheck = CheckBox(this).apply {
-            text = "流畅模式（分辨率减半 + 30fps，减少掉帧）"
+            text = "流畅模式"
             setTextColor(Color.parseColor("#333333"))
             isChecked = smoothFile.exists()
         }
         val fpsCheck = CheckBox(this).apply {
-            text = "显示 FPS 帧率（右上角）"
+            text = "显示 FPS"
             setTextColor(Color.parseColor("#333333"))
             isChecked = fpsFile.exists()
         }
@@ -403,7 +410,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         val scroll = ScrollView(this).apply { addView(layout) }
 
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog.Builder(this)
             .setTitle("设置")
             .setView(scroll)
             .setPositiveButton("保存") { _, _ ->

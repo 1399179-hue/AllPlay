@@ -6,6 +6,7 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.util.Log
 import java.nio.ByteBuffer
 
@@ -71,7 +72,7 @@ class AudioSink {
             Log.i("AllPlay", "dequeueInputBuffer 返回=$idx")
         }
         if (idx < 0) return
-        val buf = c.getInputBuffer(idx) ?: return
+        val buf = c.compatInputBuffer(idx) ?: return
         buf.clear()
         val data = if (mime == MediaFormat.MIMETYPE_AUDIO_AAC) {
             if (!firstAacLogged) {
@@ -100,7 +101,7 @@ class AudioSink {
             }
             when {
                 out >= 0 -> {
-                    val buf = c.getOutputBuffer(out)
+                    val buf = c.compatOutputBuffer(out)
                     if (buf != null && info.size > 0) {
                         val pcm = ByteArray(info.size)
                         buf.position(info.offset)
@@ -129,18 +130,25 @@ class AudioSink {
     private fun startTrack() {
         val ch = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
         val min = AudioTrack.getMinBufferSize(sampleRate, ch, AudioFormat.ENCODING_PCM_16BIT)
-        val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-            .build()
-        val format = AudioFormat.Builder()
-            .setSampleRate(sampleRate)
-            .setChannelMask(ch)
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .build()
         // 缓冲放大到 4×min，吸收 Wi-Fi 抖动的网络抖动，避免解码快但播放缓冲耗尽造成的卡顿
-        track = AudioTrack(attrs, format, min * 4, AudioTrack.MODE_STREAM,
-            AudioManager.AUDIO_SESSION_ID_GENERATE)
+        track = if (Build.VERSION.SDK_INT >= 21) {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            val format = AudioFormat.Builder()
+                .setSampleRate(sampleRate)
+                .setChannelMask(ch)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .build()
+            AudioTrack(attrs, format, min * 4, AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE)
+        } else {
+            // Android 4.4：无 AudioAttributes/AudioFormat.Builder，走旧 5 参构造
+            @Suppress("DEPRECATION")
+            AudioTrack(AudioManager.STREAM_MUSIC, sampleRate, ch,
+                AudioFormat.ENCODING_PCM_16BIT, min * 4, AudioTrack.MODE_STREAM)
+        }
         track?.setVolume(1.0f)
         Log.i("AllPlay", "AudioTrack 创建 state=${track?.state} ch=$ch rate=$sampleRate")
         track?.play()

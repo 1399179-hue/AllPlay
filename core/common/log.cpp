@@ -73,8 +73,11 @@ void logf(Level lv, const char* file, int line, const char* fmt, ...)
     }
 
     std::lock_guard<std::mutex> lk(g_mu);
+#if !defined(__ANDROID__)
+    // 桌面：打印到 stderr。Android（API<23）不导出 stderr 符号，且日志走 logcat，这里跳过。
     std::fprintf(stderr, "[%s] [%s] %s:%d  %s\n", ts, levelName(lv), baseName(file), line, msg);
     std::fflush(stderr);
+#endif
 #ifdef __ANDROID__
     {
         int prio = ANDROID_LOG_INFO;

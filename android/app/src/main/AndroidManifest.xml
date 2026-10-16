@@ -15,6 +15,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Amlogic 4.4 的 setWifiApEnabled 写系统设置需要 WRITE_SETTINGS（签名级，root 下用 pm grant 授予） -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
     <!-- JmDNS 广播需要 MulticastLock -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

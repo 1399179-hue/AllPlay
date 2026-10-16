@@ -1,7 +1,10 @@
 package com.allplay.app
 
 import android.content.Context
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.util.Log
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -16,9 +19,9 @@ import javax.jmdns.ServiceListener
 /**
  * IMdnsAdvertiser 的 Android 实现。
  *
- * 广播与发现都用 JmDNS（而非 NsdManager）：热点模式下 NsdManager 会把 mDNS 绑到错误的
- * 网卡，iPhone 收不到 _airplay._tcp 就不会发起 CarPlay。JmDNS 显式绑定热点接口 IP，
- * 且 IPv4/IPv6 各建一个实例（参照协议 useInterfaceMdns 双栈）。
+ * 广播与发现优先用 JmDNS（热点模式下要显式绑定热点接口 IP，NsdManager 会绑错网卡）。
+ * 但部分 ROM（尤其 Android 4.4 电视盒子）系统 netd 已占住 5353 端口，JmDNS bind 会
+ * EADDRINUSE；此时退回系统 NsdManager（它复用 netd 的 mDNS responder，不抢端口）。
  */
 class MdnsService(private val context: Context) {
     /** 热点接口 IPv4（AllPlaySessionService 在 nativeStart 前注入）。null/空 = 自动探测。 */
@@ -30,7 +33,21 @@ class MdnsService(private val context: Context) {
         (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
             .createMulticastLock("allplay-mdns").apply { setReferenceCounted(false) }
 
+    // JmDNS 抢不到 5353（EADDRINUSE）时退回系统 NsdManager
+    private val nsdManager =
+        context.applicationContext.getSystemService(Context.NSD_SERVICE) as NsdManager
+    private var usingNsd = false
+    private val nsdInfos = mutableListOf<NsdServiceInfo>()
+
     fun register(name: String, port: Int, txt: Array<String>): Boolean {
+        if (tryJmDnsRegister(name, port, txt)) return true
+        Log.w("AllPlay", "JmDNS 注册失败，退回系统 NsdManager")
+        usingNsd = true
+        return tryNsdRegister(name, port, txt)
+    }
+
+    /// JmDNS 路径：显式绑定接口（热点模式需要）。
+    private fun tryJmDnsRegister(name: String, port: Int, txt: Array<String>): Boolean {
         return try {
             multicastLock.acquire()
             val map = HashMap<String, String>()
@@ -42,10 +59,8 @@ class MdnsService(private val context: Context) {
             for (addr in addrs) {
                 val dns = JmDNS.create(addr)
                 jmdnsList.add(dns)
-                // 只在 IPv4 上广播。iPhone 走 IPv4 连 RTSP；IPv6 的 JmDNS 只用于发现 _carplay-ctrl。
                 if (addr is Inet4Address) {
                     dns.registerService(ServiceInfo.create("_airplay._tcp.local.", name, port, 0, 0, map))
-                    // 同网模式：iPhone 可能靠 _carplay._tcp 发现 CarPlay 接收端（而非 _airplay._tcp）
                     dns.registerService(ServiceInfo.create("_carplay._tcp.local.", name, port, 0, 0, map))
                     Log.i("AllPlay", "JmDNS 广播 _airplay/_carplay._tcp iface=$addr")
                 } else {
@@ -65,8 +80,52 @@ class MdnsService(private val context: Context) {
         }
     }
 
+    /// NsdManager 路径：复用系统 netd 的 mDNS responder，广播 _airplay/_carplay._tcp。
+    private fun tryNsdRegister(name: String, port: Int, txt: Array<String>): Boolean {
+        val types = arrayOf("_airplay._tcp", "_carplay._tcp")
+        return try {
+            types.forEach { type ->
+                val info = NsdServiceInfo().apply {
+                    serviceName = name
+                    serviceType = type
+                    setPort(port)
+                }
+                setTxtRecordCompat(info, txt)
+                nsdManager.registerService(info, NsdManager.PROTOCOL_DNS_SD,
+                    object : NsdManager.RegistrationListener {
+                        override fun onServiceRegistered(i: NsdServiceInfo) {
+                            Log.i("AllPlay", "NsdManager 已广播 ${i.serviceType} name=${i.serviceName}")
+                        }
+                        override fun onRegistrationFailed(i: NsdServiceInfo, errorCode: Int) {
+                            Log.w("AllPlay", "NsdManager 广播失败 ${i.serviceType} code=$errorCode")
+                        }
+                        override fun onServiceUnregistered(i: NsdServiceInfo) {}
+                        override fun onUnregistrationFailed(i: NsdServiceInfo, errorCode: Int) {}
+                    })
+                nsdInfos.add(info)
+            }
+            true
+        } catch (e: Exception) {
+            Log.w("AllPlay", "NsdManager 注册失败 ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+    }
+
+    /// 设置 TXT：API 21+ 用 setAttribute；API 19 不设（setTxtRecord(byte[]) 不存在、
+    /// setTxtRecord(DnsSdTxtRecord) 会导致 NsdServiceInfo Binder 序列化失败 → mDNS 注册失败）。
+    /// 实测 API 19 上 TXT 为 null 时 iPhone 靠蓝牙 0x4301 + RTSP /info 就能连，TXT 不是必需。
+    private fun setTxtRecordCompat(info: NsdServiceInfo, txt: Array<String>) {
+        if (Build.VERSION.SDK_INT >= 21) {
+            txt.forEach { kv ->
+                val i = kv.indexOf('=')
+                if (i > 0) info.setAttribute(kv.substring(0, i), kv.substring(i + 1))
+            }
+        }
+    }
+
     /// 发现 iPhone 的 _carplay-ctrl._tcp，解析出 host/port 后回调。
     fun discoverCarPlayCtrl(onResolved: (host: String, port: Int) -> Unit) {
+        if (usingNsd) { discoverNsd(onResolved); return }
         if (jmdnsList.isEmpty()) return
         val listener = object : ServiceListener {
             override fun serviceAdded(event: ServiceEvent) {
@@ -87,6 +146,34 @@ class MdnsService(private val context: Context) {
             dns.addServiceListener("_carplay-ctrl._tcp.local.", listener)
             Log.i("AllPlay", "JmDNS 发现 _carplay-ctrl 挂到 ${dns.inetAddress}")
         }
+    }
+
+    private fun discoverNsd(onResolved: (host: String, port: Int) -> Unit) {
+        nsdManager.discoverServices("_carplay-ctrl._tcp", NsdManager.PROTOCOL_DNS_SD,
+            object : NsdManager.DiscoveryListener {
+                override fun onDiscoveryStarted(serviceType: String) {
+                    Log.i("AllPlay", "NsdManager 开始发现 $serviceType")
+                }
+                override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                    Log.i("AllPlay", "NsdManager 发现 _carplay-ctrl name=${serviceInfo.serviceName}")
+                    nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                            Log.w("AllPlay", "NsdManager resolve 失败 code=$errorCode")
+                        }
+                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                            val host = serviceInfo.host?.hostAddress
+                            Log.i("AllPlay", "NsdManager _carplay-ctrl resolved host=$host port=${serviceInfo.port}")
+                            if (host != null) onResolved(host, serviceInfo.port)
+                        }
+                    })
+                }
+                override fun onServiceLost(serviceInfo: NsdServiceInfo) {}
+                override fun onDiscoveryStopped(serviceType: String) {}
+                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                    Log.w("AllPlay", "NsdManager 开始发现失败 code=$errorCode")
+                }
+                override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
+            })
     }
 
     /// 探测 iPhone：GET /ctrl-int/1/connect（参照协议 CarPlayBonjour 请求格式）
@@ -118,6 +205,16 @@ class MdnsService(private val context: Context) {
         }
         jmdnsList.clear()
         serviceInfo = null
+        nsdInfos.forEach { info ->
+            try { nsdManager.unregisterService(object : NsdManager.RegistrationListener {
+                override fun onServiceUnregistered(i: NsdServiceInfo) {}
+                override fun onUnregistrationFailed(i: NsdServiceInfo, errorCode: Int) {}
+                override fun onServiceRegistered(i: NsdServiceInfo) {}
+                override fun onRegistrationFailed(i: NsdServiceInfo, errorCode: Int) {}
+            }) } catch (_: Exception) {}
+        }
+        nsdInfos.clear()
+        usingNsd = false
         if (multicastLock.isHeld) multicastLock.release()
     }
 
@@ -142,7 +239,6 @@ class MdnsService(private val context: Context) {
                 }
             }
             if (out.isEmpty()) out.addAll(fallback)
-            // IPv4 在前（优先）
             out.sortBy { if (it is Inet4Address) 0 else 1 }
             out
         } catch (_: Exception) {

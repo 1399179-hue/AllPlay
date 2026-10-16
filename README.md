@@ -242,10 +242,11 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./build/allplay_host \
 ### Android
 
 ```bash
-cd android && ./gradlew :app:assembleDebug      # 需要 Android SDK + NDK + 为 arm64-v8a 交叉编译的 OpenSSL
+cd android && ./gradlew :app:assembleDebug      # 需要 Android SDK + NDK + 为 arm64-v8a/armeabi-v7a 交叉编译的 OpenSSL
 ```
 
-`minSdk 28`（Android 8.0+）、`targetSdk 34`、ABI 只出 `arm64-v8a`。
+`minSdk 19`（Android 4.4+）、`targetSdk 34`、ABI 出 `arm64-v8a` + `armeabi-v7a`（32 位盒子用后者）。
+NDK 需用 **r25c**（r26 起不支持 API 19）；OpenSSL 按 ABI 分目录（`openssl-arm64` / `openssl-arm`）。
 交叉编译说明见 `android/app/src/main/cpp/CMakeLists.txt` 顶部。
 
 ## 当前状态
@@ -255,7 +256,7 @@ cd android && ./gradlew :app:assembleDebug      # 需要 Android SDK + NDK + 为
 | M0 | 骨架：CMake + SDL 窗口/状态栏 + 脚本 | ✅ |
 | M1 | core：RTSP + `/info`(bplist) + mDNS 广播 `_airplay._tcp` | ✅ |
 | M2 | 蓝牙触发：iAP2 协议栈（识别 / MFi / 订阅 / 0x5703 / 0x4301） | ✅ 软件完成；**Linux BlueZ 接通真机 iPhone，整链走到 `0x4301 CarPlayStartSession`** |
-| M3 | 会话 + 视频：pair-setup/verify、auth-setup、SETUP、ControlCipher、屏幕流 | ✅ 安卓端到端；✅ 桌面 ffmpeg 解码上屏；✅ **真 iPhone 在 Ubuntu 桌面上跑通（2026-10-12）** |
+| M3 | 会话 + 视频：pair-setup/verify、auth-setup、SETUP、ControlCipher、屏幕流 | ✅ 安卓端到端（含 Android 4.4 盒子）；✅ 桌面 ffmpeg 解码上屏；✅ **真 iPhone 在 Ubuntu 桌面上跑通（2026-10-12）** |
 | M4 | 有线（USB）CarPlay：libusb 切配置 + usbmux/lockdown/TLS + 内核 `cdc_ncm` 媒体面 | ✅ **真 iPhone 有线端到端跑通（2026-10-13），宿主 `--wired`** |
 | M5 | 状态栏信息 + 健壮性（重连 / 关键帧恢复 / watchdog） | 部分（关键帧恢复已接） |
 | M6 | UI 状态页 / 叠加（原生） | |

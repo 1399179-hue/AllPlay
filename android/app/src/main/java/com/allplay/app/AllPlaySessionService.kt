@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
@@ -64,16 +65,15 @@ class AllPlaySessionService : Service() {
     /// 屏幕方向：默认横屏（宽 > 高）；files/portrait 存在则竖屏（宽 < 高）。
     /// 流畅模式：分辨率减半（像素降到 1/4，比例不变）。
     private fun resolutionForOrientation(): Pair<Int, Int> {
+        val portraitMode = java.io.File(filesDir, "portrait").exists()
+        // 性能模式：固定 1280x720 @ 30fps（不再分辨率减半）
+        if (smoothMode) return if (portraitMode) 720 to 1280 else 1280 to 720
         val wm = getSystemService(WINDOW_SERVICE) as android.view.WindowManager
         val dm = android.util.DisplayMetrics()
         wm.defaultDisplay.getRealMetrics(dm)
-        val portraitMode = java.io.File(filesDir, "portrait").exists()
         val big = maxOf(dm.widthPixels, dm.heightPixels)
         val small = minOf(dm.widthPixels, dm.heightPixels)
-        var w = if (portraitMode) small else big
-        var h = if (portraitMode) big else small
-        if (smoothMode) { w /= 2; h /= 2 }
-        return w to h
+        return if (portraitMode) small to big else big to small
     }
 
     private fun startNative(restart: Boolean = false) {
@@ -259,9 +259,18 @@ class AllPlaySessionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun buildNotification(): Notification {
-        val ch = NotificationChannel("allplay", "AllPlay 投屏", NotificationManager.IMPORTANCE_LOW)
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-        return Notification.Builder(this, "allplay")
+        if (Build.VERSION.SDK_INT >= 26) {
+            val ch = NotificationChannel("allplay", "AllPlay 投屏", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+            return Notification.Builder(this, "allplay")
+                .setContentTitle("AllPlay")
+                .setContentText("等待 iPhone 连接…")
+                .setSmallIcon(android.R.drawable.ic_menu_view)
+                .build()
+        }
+        // Android 4.4：无 NotificationChannel，用旧构造器
+        @Suppress("DEPRECATION")
+        return Notification.Builder(this)
             .setContentTitle("AllPlay")
             .setContentText("等待 iPhone 连接…")
             .setSmallIcon(android.R.drawable.ic_menu_view)

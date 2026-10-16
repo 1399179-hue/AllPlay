@@ -2,6 +2,7 @@ package com.allplay.app
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -101,9 +102,14 @@ class MediaCodecSink {
         // 失败则用最近一次配置重建（参照 setOutputSurface → reconfigure 兜底）
         val c = codec
         if (c != null) {
-            try {
-                c.setOutputSurface(s)
-            } catch (e: Exception) {
+            // setOutputSurface 是 API 23；4.4 上直接按最近一次配置重建解码器
+            if (Build.VERSION.SDK_INT >= 23) {
+                try {
+                    c.setOutputSurface(s)
+                } catch (e: Exception) {
+                    lastCodecData?.let { configure(lastCodecType, width, height, it) }
+                }
+            } else {
                 lastCodecData?.let { configure(lastCodecType, width, height, it) }
             }
         } else {
@@ -126,7 +132,7 @@ class MediaCodecSink {
                 drain()
             }
             if (idx < 0) return false
-            val buf = c.getInputBuffer(idx) ?: return false
+            val buf = c.compatInputBuffer(idx) ?: return false
             buf.clear()
             if (data.size > buf.remaining()) return false   // 超大帧：参考链已断，交给上层重放闸 + 重配
             buf.put(data)
