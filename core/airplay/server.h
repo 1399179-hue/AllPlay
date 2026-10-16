@@ -30,6 +30,10 @@ namespace core::airplay {
 struct ReceiverConfig {
     std::string name     = "AllPlay";
     std::string ifname;                     ///< 空 = 自动挑（第一块有 IPv4 的非 lo）
+    /// 显式绑定的本端地址。**空 = 通配**（无线那条路就是这样，靠 mDNS 广播 + 手机自己找）。
+    /// 有线必须给：手机是从 0x4301 里拿到地址直接来连的，绑到通配等于把地址说错。
+    /// 填 NCM 网卡上的链路本地（配 ifname 一起给，链路本地会自动补 %scope）。
+    std::string bindAddr;
     uint16_t    port     = 7000;            ///< 被占自动 +1，最多试 20 次；0 = 内核选
     int         width    = 1280;
     int         height   = 720;

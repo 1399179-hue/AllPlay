@@ -40,6 +40,11 @@ struct LinkConfig {
     uint8_t  maxRetransmissions     = 4;
     uint8_t  maxAcknowledgements    = 3;
     uint8_t  controlSessionVersion  = 1;
+
+    /// 主机主动发起协商（有线 = true；无线 = false）。
+    /// 无线是手机先发 marker、本端回 SYN；有线反过来 —— 主机发完 marker **立刻自己发 SYN**，
+    /// 不等对端 marker。搞反了的现象很好认：marker 发出去之后对端一直沉默，什么都没回来。
+    bool     initiator              = false;
 };
 
 class LinkEngine {
@@ -66,6 +71,9 @@ public:
     /// 对端可承载的最大控制载荷（对端 maxLength - 10），未协商时给保守值
     size_t peerMaxPayload() const;
 
+    /// 对端 SYN 里报的那几个参数，一行摘要。协商卡住时第一个要看的就是它。
+    std::string peerSummary() const;
+
 private:
     enum class State { Idle, Detecting, Negotiating, Normal, Dead };
 
@@ -80,6 +88,7 @@ private:
     };
 
     void die(const std::string& why);
+    void enterNegotiating(uint64_t nowMs);
     void appendOutput(const std::vector<uint8_t>& bytes);
     void writeFrame(uint8_t control, uint8_t seq, uint8_t session,
                     const std::vector<uint8_t>* payload);

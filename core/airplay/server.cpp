@@ -21,15 +21,25 @@ bool Receiver::start(const ReceiverConfig& cfg, const core::PlatformServices& se
     }
 
     // ---- 1) 网卡 / IP ----
-    if (cfg_.ifname.empty()) {
-        ip_ = services.network->pickInterfaceIPv4(&ifname_);
+    // 有线和无线在这一步分叉得很干脆：
+    //   无线 —— 不知道手机从哪张网卡过来，挑一块有 IPv4 的，再靠 mDNS 告诉手机；
+    //   有线 —— 手机是从 0x4301 里读地址的，**地址是我们先定好的**（NCM 网卡上的
+    //           链路本地，见 allplay::posix::prepareWiredNcm），而且那张网卡上没有
+    //           IPv4。所以这里不能拿"有没有 IPv4"当成功判据。
+    if (cfg_.bindAddr.empty()) {
+        if (cfg_.ifname.empty()) {
+            ip_ = services.network->pickInterfaceIPv4(&ifname_);
+        } else {
+            ifname_ = cfg_.ifname;
+            ip_ = services.network->interfaceIPv4(ifname_);
+        }
+        if (ip_.empty()) {
+            if (err) *err = "找不到可用网卡（用 --ifname 显式指定）";
+            return false;
+        }
     } else {
         ifname_ = cfg_.ifname;
-        ip_ = services.network->interfaceIPv4(ifname_);
-    }
-    if (ip_.empty()) {
-        if (err) *err = "找不到可用网卡（用 --ifname 显式指定）";
-        return false;
+        ip_     = cfg_.bindAddr;
     }
     // ---- 2) 本机身份（Ed25519 + pi）----
     const std::string stateDir = cfg_.stateDir.empty() ? defaultStateDir() : cfg_.stateDir;
@@ -68,15 +78,23 @@ bool Receiver::start(const ReceiverConfig& cfg, const core::PlatformServices& se
     session_ = std::make_unique<Session>(sc);
 
     // ---- 6) RTSP 服务器（端口被占自动往后退）----
+    // 绑定地址：链路本地要补 %网卡（不补的话平台层 bind 会 EINVAL）—— 这个补法放在
+    // 这里而不是让调用方拼，是因为调用方手里只有"地址 + 网卡名"两个独立的东西。
+    std::string bindAddr = cfg_.bindAddr;
+    if (!bindAddr.empty() && bindAddr.find('%') == std::string::npos &&
+        !ifname_.empty() && bindAddr.rfind("fe80:") == 0) {
+        bindAddr += "%" + ifname_;
+    }
+
     std::unique_ptr<core::ITcpListener> listener;
     std::string rerr;
     if (cfg_.port == 0) {
         auto l = services.makeTcpListener();
-        if (l && l->start("", 0, &rerr)) listener = std::move(l);
+        if (l && l->start(bindAddr, 0, &rerr)) listener = std::move(l);
     } else {
         for (uint16_t p = cfg_.port; p < cfg_.port + 20; ++p) {
             auto l = services.makeTcpListener();
-            if (l && l->start("", p, &rerr)) {
+            if (l && l->start(bindAddr, p, &rerr)) {
                 listener = std::move(l);
                 if (p != cfg_.port) LOG_WARN("端口 %u 被占，改用 %u", cfg_.port, p);
                 break;

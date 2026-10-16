@@ -7,6 +7,80 @@
 
 ---
 
+## [v0.4] — 有线（USB）CarPlay · 2026-10-13
+
+**插上数据线就行。** 前几版走的都是无线（蓝牙叫醒 + 同一局域网）。这一版加了**有线**那条路：
+USB 控制面整条自己写，媒体面交给内核，最后把手机引到和无线**同一套** RTSP / 加密 / 屏幕流代码上。
+
+![真 iPhone 的有线 CarPlay 界面渲染在 Ubuntu 上](docs/images/carplay-wired.jpg)
+
+（上图：真 iPhone 插着数据线，宿主 `--wired` 跑在 Ubuntu 上 —— 这一轮宿主侧**渲染满 3000 帧**
+正常退出，零 WARN/ERR。另有一轮探针侧的 200 秒长跑：收 1320 帧 / 12.4 MB，全程不掉线。）
+
+![注入一次触摸后，CarPlay 跟着进了"外观"页](docs/images/carplay-wired-touch.jpg)
+
+（上图：`--inject-touch 0.5,0.72` 打在"外观"那一行上，手机**真的导航进了这一页** ——
+投出去的事件通道 HID 有线这条路上一样被接受。）
+
+### 新增
+
+**有线控制面（`core/usb/`，平台无关）**
+- `usbmux` v2：版本协商 + setup + 迷你 TCP（手机那侧是个 TCP 栈，成帧要自己来）。
+- `wired_control`：串起手机要的三条连接 —— ① 明文 lockdown 配对 → ② 会话**原地升 TLS** →
+  ③ `StartService(carkit)` 拿到的 iAP2 流。三条缺一条都拿不到最后那条服务流。
+- `platform/posix/usb_libusb`：只做两件事 —— 把 iPhone 切进 **CarPlay 配置**（锁屏时它只报
+  1 个配置，这是 iOS 的行为不是线的问题），以及把 USBMUX 口的 bulk 端点包成 `IByteStream`。
+
+**有线 iAP2（`core/iap2/wired_link`）**
+- 链路层**由主机发起**：发完 6 字节 marker 之后不等任何回话，自己立刻发 SYN 并每 500ms 重发。
+  只发 marker 的话手机一声不吭（干等 260 秒零字节）—— 这是最早那版 naive 实现的死法。
+- `0x4300` 解析 + `0x4301 CarPlayStartSession` 组装。有线组的报文结构容易搭错：
+  地址是**每个地址一个 string 参数、重复 id 0**，不是字符串列表。
+
+**有线媒体面**——**自己不写**。切进 CarPlay 配置后内核的 `cdc_ncm` 会建出一块真网卡，
+AirPlay 直接绑到那块网卡的 IPv6 链路本地地址上，NTB16 / 以太网 / IPv6 全是内核的事。
+
+**宿主 `--wired`（`host/wired_task`）**：和 `--bt` 对称，但**相位不同** —— 无线是
+"Receiver 先起、手机找过来"，有线是"手机从 `0x4301` 里**读**地址"，所以 Receiver 必须等
+USB 侧拆到知道 NCM 网卡叫什么、地址钉成哪个之后才能起。任务因此分两段（准备 / 保活），
+`rx` 的生命周期仍然只有一个线程在管。准备失败时按 `W` 重来一次，不用重启程序。
+
+**触摸**：有线这条路上触摸走的是**和无线完全相同**的那条事件通道（`POST /command` + 加密 HID），
+一行都没改。真机验证：注入一次点击打在"外观"那一行，手机跟着进了该页（见上图）。
+
+**探针**：`tools/usb_probe`（切配置）、`tools/wired_probe`（控制面，含 `--selftest` 离线自检）。
+
+### 修复
+
+下面这些**只有真机才暴露**。
+
+- **`0x4301` 发了，手机却不来连 —— Receiver 绑错地址。** 有线这条路上地址是**我们先定好的**
+  （NCM 网卡上的链路本地），`0x4301` 报的必须和 Receiver 实际监听的一模一样。原 `Receiver::start`
+  拿"有没有 IPv4"当成功判据，而 NCM 网卡上**根本没有 IPv4**，于是它去绑通配 —— 手机照着
+  `0x4301` 里的地址连过来，扑空。新增 `ReceiverConfig::bindAddr`：显式绑定跳过 IPv4 判据。
+- **链路本地地址 `bind()` 报 EINVAL。** `fe80::/10` 的地址绑定必须带 `sin6_scope_id`，
+  否则内核直接拒绝（而且报的是 EINVAL，看着像参数写错了）。现在 `bindAddr` 支持 `%网卡` 后缀，
+  裸 `fe80:` 地址由 `Receiver` 自己补上 `%ifname`。
+- **NCM 网卡上一个 IPv6 地址都没有。** 内核在它上面 `addr_gen_mode=1`（不生成任何地址），
+  同时 NetworkManager 把这根点对点链路当"有线连接"去要 DHCP（那儿根本没有 DHCP 服务器），
+  一直卡在 connecting 并随时可能清掉地址。新增 `allplay::posix::prepareWiredNcm`：
+  `nmcli device set … managed no` → `ip link set up` → 钉 `fe80::2/64 … nodad`，
+  网卡名按 USB `busnum`/`devnum` 反查 `/sys/class/net/*/device/..`（名字由 MAC 来，不能写死）。
+- **控制面全绿、`RECORD` 也过了，然后卡在 `/feedback`** —— 每 2 秒一次，永远等不到画面。
+  根因是 `SETUP` 里手机要屏幕流、我们没接 `IVideoOutput` 就没给 `dataPort`，手机拿不到数据端口
+  只能干等。宿主本来就接了 sink，所以只有探针中招；已在探针里补一个只点数的 sink。
+- **`pkill -f wired_probe` 会把执行它的那个 shell 一起杀掉**（shell 自己的命令行里就含这个串），
+  于是"杀掉旧进程再重新编译"那条命令链在第 1 步就断了，后面的编译根本没跑，看起来却像编译失败。
+
+### 注意
+
+- 有线**只在 Linux 上做**：媒体面依赖内核 `cdc_ncm`，macOS / Windows 没有对应物。
+- 没有 `libusb-1.0-dev` 时 CMake 会跳过整条有线链路，`--wired` 会明确报"这个构建没带 libusb"。
+- 跑之前的三件前置（停 `usbmuxd`、`pkill gvfsd-gphoto2`、blacklist `apple_mfi_fastcharge`）
+  和 `sudo` 环境下的两个坑见 [README 的有线前置条件](README.md#有线的前置条件linux缺一不可)。
+
+---
+
 ## [v0.3] — 真 iPhone 端到端 · 2026-10-12
 
 **手机是被宿主自己叫来的。** v0.2 证明的是"拿到流能渲染"，这一版证明的是"能主动把真机叫来"：
@@ -14,10 +88,6 @@
 **CarPlay 画面出现在 Ubuntu 桌面上，触摸回传可点。**
 
 ![真 iPhone 的 CarPlay 界面渲染在 Ubuntu 桌面上](docs/images/carplay-home.jpg)
-
-窗口标题栏、底部状态栏（`STREAMING` + `1280x720 | 帧率 | 帧数`）、以及手机自己的 CarPlay
-界面（中文，电话图标上挂着 30 的角标）都在。第二张是点进 CarPlay 设置页 ——
-[`carplay-settings.jpg`](docs/images/carplay-settings.jpg)，说明触摸回传也通了。
 
 ### 新增
 

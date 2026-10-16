@@ -19,6 +19,7 @@
 #include "launcher.h"
 #include "screenshot.h"
 #include "statusbar.h"
+#include "wired_task.h"
 
 #include "airplay/server.h"
 #include "common/log.h"
@@ -61,6 +62,10 @@ struct Options {
     bool        noVideo   = false;
     bool        noAudio   = false;
     std::string dump;                // --dump：退出前把最后一帧存成 PPM
+    // —— 有线接入（--wired 才启用；和 --bt 互斥，见 main 里的检查）——
+    bool        wiredOn   = false;
+    std::string ncmLinkLocal;            // --ncm-link-local：空 = fe80::2
+    int         wiredPid  = -1;          // --wired-pid：限定产品号（默认不限）
     // —— 蓝牙触发（--bt 才启用；不加就维持纯接收端，行为与之前完全一致）——
     bool        btOn     = false;
     std::string btAddr;                 // --bt-addr：按地址直连，空则按名字找
@@ -97,6 +102,16 @@ void printUsage(const char* argv0)
         "  --dump PATH       退出前把最后一帧画面存成 PPM（无人值守时校验界面）\n"
         "  --inject-touch U,V 连上后自动注入一次触摸（U/V 按视频矩形归一化 0..1）——\n"
         "                    无头验证触摸链路用，配 tools/fake_phone 看它打印的坐标\n"
+        "  --wired           走**有线**（USB）CarPlay：插着数据线的 iPhone 直连，不靠蓝牙/Wi-Fi。\n"
+        "                    跑之前必须（缺一不可，否则一到切配置就 BUSY）：\n"
+        "                      sudo systemctl stop usbmuxd && sudo systemctl mask usbmuxd\n"
+        "                      pkill -f gvfsd-gphoto2\n"
+        "                    而且 /dev/bus/usb 是 root 独占的，**整个程序要 sudo 跑**\n"
+        "                    （sudo 会 reset 环境：日志用 sudo env ALLPLAY_LOG=… ，\n"
+        "                      状态目录要显式给 --state-dir，否则 HOME 变成 /root）\n"
+        "  --ncm-link-local A 有线：钉在 NCM 网卡上的 IPv6 链路本地（默认 fe80::2）。\n"
+        "                    手机是拿 0x4301 里这个地址来连的，改了只是换个值，但两端得一致\n"
+        "  --wired-pid N      有线：限定产品号（默认不限，苹果键盘/集线器会被自动排除）\n"
         "  --bt              启动后主动触发 iPhone（蓝牙 iAP2 → 0x4301），再把画面投出来\n"
         "  --bt-addr A:B:C:D:E:F  按蓝牙地址直连（比按名字可靠，跳过名字匹配）\n"
         "  --bt-device NAME   要触发的设备名（包含匹配，默认 iPhone）\n"
@@ -107,7 +122,8 @@ void printUsage(const char* argv0)
         "  --bt-retry N       触发失败的整链重试次数（默认 10，每次间隔 3 秒）\n"
         "  -h, --help        显示本帮助\n"
         "\n"
-        "退出：窗口关闭 / ESC / Ctrl-C。开了 --bt 时，运行时按 B 可重新触发一次。\n",
+        "退出：窗口关闭 / ESC / Ctrl-C。\n"
+        "运行时：--bt 按 B 重新触发一次；--wired 准备失败时按 W 重来一次。\n",
         argv0);
 }
 
@@ -164,6 +180,12 @@ bool parseArgs(int argc, char** argv, Options* o)
             o->noAudio = true;
         } else if (!std::strcmp(a, "--dump")) {
             o->dump = need(a);
+        } else if (!std::strcmp(a, "--wired")) {
+            o->wiredOn = true;
+        } else if (!std::strcmp(a, "--ncm-link-local")) {
+            o->ncmLinkLocal = need(a);
+        } else if (!std::strcmp(a, "--wired-pid")) {
+            o->wiredPid = std::atoi(need(a));
         } else if (!std::strcmp(a, "--bt")) {
             o->btOn = true;
         } else if (!std::strcmp(a, "--bt-addr")) {
@@ -389,6 +411,20 @@ int main(int argc, char** argv)
 #endif
 
     // —— 启动协议核心 ——
+    // 有线和无线在这儿差的是**谁先谁后**，不是配置：
+    //   无线：Receiver 先起（绑通配 + mDNS 广播），让手机自己找过来 —— "地址"是我们广播的。
+    //   有线：手机是从 0x4301 里**读**地址和端口的，所以 Receiver 必须等 USB 侧拆到
+    //         "NCM 网卡叫什么、地址钉成哪个"之后才能起（见 wired_task.h 的相位说明）。
+    //         这里把 rx.start() 推迟到主循环里那一支去调。
+    if (opt.wiredOn && opt.btOn) {
+        std::fprintf(stderr, "[host] --wired 和 --bt 是两条互斥的路（一个插线、一个走蓝牙），"
+                             "别一起开\n");
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 2;
+    }
+
     core::airplay::Receiver rx;
     core::airplay::ReceiverConfig cfg;
     cfg.name      = opt.name;
@@ -402,22 +438,60 @@ int main(int argc, char** argv)
     cfg.video     = vid;
     cfg.audio     = aud;
 
+    // 平台服务要在 main 的整个生命周期里活着：Receiver 只拷了一份，而 Session 到 SETUP
+    // 才第一次用它去建数据/事件通道（存临时对象的地址就是当年那个悬垂指针）。
+    auto services = allplay::posix::makePlatformServices();
     std::string err;
-    if (!rx.start(cfg, allplay::posix::makePlatformServices(), &err)) {
-        std::fprintf(stderr, "[host] 核心启动失败：%s\n", err.c_str());
-        SDL_DestroyRenderer(ren);
-        SDL_DestroyWindow(win);
-        SDL_Quit();
-        return 1;
+
+    // —— 有线接入任务（--wired）——
+    allplay::WiredTask        wiredTask;
+    allplay::WiredTaskOptions wopt;
+    bool                      wiredReceiverUp = false;  // Receiver 起来没有（只此一处赋值）
+    std::string               wiredLastErr;             // 报过的失败原因：同一个原因别刷屏
+    // 链路断掉之后隔多久自己再准备一次。3 秒和 bt_task 的重试节奏一致 —— 拔线重插、
+    // 解锁、点"信任"都得几秒，更快只是白跑 USB 枚举。
+    const uint64_t            kWiredRearmMs = 3000;
+    uint64_t                  wiredRearmAt  = SDL_GetTicks64() + kWiredRearmMs;
+    wopt.name         = opt.name;
+    wopt.mfiDir       = opt.identityDir;
+    wopt.stateDir     = opt.stateDir;   // 配对材料存这儿：不存就每次都弹信任框
+    wopt.ncmLinkLocal = opt.ncmLinkLocal;
+    wopt.productId    = opt.wiredPid;
+    auto wiredLog = [](const std::string& s) {
+        std::printf("[wired] %s\n", s.c_str());
+        std::fflush(stdout);
+    };
+
+    if (!opt.wiredOn) {
+        if (!rx.start(cfg, services, &err)) {
+            std::fprintf(stderr, "[host] 核心启动失败：%s\n", err.c_str());
+            SDL_DestroyRenderer(ren);
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 1;
+        }
+        std::printf("[host] RTSP :%u  ifname=%s ip=%s deviceid=%s\n",
+                    rx.port(), rx.ifname().c_str(), rx.ip().c_str(), rx.info().deviceId.c_str());
+        if (cfg.enableAvahi) {
+            std::printf("[host] Bonjour: %s\n",
+                        rx.avahiError().empty() ? "已广播 _airplay._tcp"
+                                                : ("不可用（" + rx.avahiError() + "）").c_str());
+        }
+        std::printf("[host] READY —— 等 iPhone 连接（假手机：tools/fake_phone）\n");
+    } else {
+        // 有线不广播：地址是我们通过 0x4301 直接告诉手机的，mDNS 反而多余。
+        cfg.enableAvahi = false;
+        std::printf("[host] 有线模式：准备 USB 链路…\n"
+                    "       手机首次会弹\"信任此电脑\"，去点一下；锁屏时它只报 1 个配置，\n"
+                    "       得先解锁（这不是线的问题）。\n");
+        if (!wiredTask.beginBringUp(wopt, wiredLog)) {
+            std::fprintf(stderr, "[host] 有线任务没能启动\n");
+            SDL_DestroyRenderer(ren);
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 1;
+        }
     }
-    std::printf("[host] RTSP :%u  ifname=%s ip=%s deviceid=%s\n",
-                rx.port(), rx.ifname().c_str(), rx.ip().c_str(), rx.info().deviceId.c_str());
-    if (cfg.enableAvahi) {
-        std::printf("[host] Bonjour: %s\n",
-                    rx.avahiError().empty() ? "已广播 _airplay._tcp"
-                                            : ("不可用（" + rx.avahiError() + "）").c_str());
-    }
-    std::printf("[host] READY —— 等 iPhone 连接（假手机：tools/fake_phone）\n");
     std::fflush(stdout);
 
     // —— 蓝牙触发（--bt）——
@@ -455,6 +529,19 @@ int main(int argc, char** argv)
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) running = false;
+            else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_w &&
+                     opt.wiredOn && !wiredReceiverUp) {
+                // 手机解锁了、线重插了、刚才没人点"信任"…… 都不用重启程序。
+                // Receiver 已经起来之后不给重来：那条链路是 0x4301 报出去过的，不能偷偷换。
+                if (wiredTask.beginBringUp(wopt, wiredLog)) {
+                    wiredLastErr.clear();   // 手动重来：失败原因值得从头再报一次
+                    std::printf("[host] 重新准备有线链路…\n");
+                    std::fflush(stdout);
+                } else {
+                    std::printf("[host] 上一次准备还在跑，稍候再按 W\n");
+                    std::fflush(stdout);
+                }
+            }
             else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_b && opt.btOn) {
                 // 触发失败、或手机掉线之后，不用重启程序
                 if (btTask.start(rx, btOpt, btLog)) {
@@ -476,9 +563,69 @@ int main(int argc, char** argv)
         status.audioUnderruns.store(audioSink.underruns());
 #endif
 
+        // —— 有线：链路断了要能自己活过来 ——
+        // 会话结束（拔线、手机锁屏、重枚举）之后 runPump 把相位落到 Done，而
+        // wiredReceiverUp 还立着 —— 不把它放下来，这程序就只剩"重启"一条路：
+        // 连 W 都被 !wiredReceiverUp 挡在门外。放下来 + 冷却几秒自己重来，拔了再插就行。
+        if (opt.wiredOn && wiredReceiverUp && wiredTask.pumpDone()) {
+            std::printf("[host] 有线链路断了 —— 收起 RTSP，%llu 秒后自动重新准备\n",
+                        static_cast<unsigned long long>(kWiredRearmMs / 1000));
+            std::fflush(stdout);
+            rx.stop();                 // 网卡可能整块消失过（重枚举），监听得跟着重来
+            wiredReceiverUp = false;
+            wiredRearmAt    = SDL_GetTicks64() + kWiredRearmMs;
+        }
+
+        // —— 有线：USB 侧就绪之后才起 Receiver（全程序**只有这一处**调 rx.start）——
+        if (opt.wiredOn && !wiredReceiverUp) {
+            const allplay::WiredPhase wp = wiredTask.phase();
+            if (wp == allplay::WiredPhase::Ready) {
+                const allplay::WiredBringUp& bu = wiredTask.result();
+                cfg.ifname   = bu.ifname;
+                cfg.bindAddr = bu.bindAddr;   // 链路本地，server.cpp 会自己补 %网卡
+                if (!rx.start(cfg, services, &err)) {
+                    // 这里失败基本只有一个原因：那张网卡的 7000 被占了。
+                    std::fprintf(stderr, "[host] 有线：Receiver 起不来：%s\n", err.c_str());
+                    running = false;
+                } else {
+                    wiredReceiverUp = true;
+                    std::printf("[host] 有线 RTSP [%s%%%s]:%u（deviceid %s）\n", rx.ip().c_str(),
+                                rx.ifname().c_str(), unsigned(rx.port()),
+                                rx.info().deviceId.c_str());
+                    // 0x4301 里报的端口/deviceid/公钥，全部取自 rx 自己 —— 见 startPump 注释
+                    if (!wiredTask.startPump(rx, wiredLog)) {
+                        std::printf("[host] 有线：0x4301 那一支没起来\n");
+                    }
+                    std::fflush(stdout);
+                }
+            } else if (wp == allplay::WiredPhase::Failed && wiredTask.error() != wiredLastErr) {
+                // 同一个原因只报一次：手机没插时每 3 秒重试一轮，刷屏没有意义。
+                // 原因变了（比如从"找不到设备"变成"配对超时"）说明情况在动，再报一次。
+                wiredLastErr = wiredTask.error();
+                std::printf("[host] 有线准备失败：%s\n"
+                            "       （会自动重试；手机锁屏就先解锁、没点过\"信任\"就去点一下）\n",
+                            wiredLastErr.c_str());
+                std::fflush(stdout);
+            }
+            // 没准备好就按冷却自己再来一次 —— 拔了再插、解锁、点过"信任"之后都不用按键。
+            // 放在上面那条之后：先让人看见失败原因，再重试。
+            if (!wiredReceiverUp &&
+                (wp == allplay::WiredPhase::Failed || wp == allplay::WiredPhase::Done) &&
+                SDL_GetTicks64() >= wiredRearmAt) {
+                if (wiredTask.beginBringUp(wopt, wiredLog))
+                    wiredRearmAt = SDL_GetTicks64() + kWiredRearmMs;
+            }
+        }
+
         // —— 核心状态 → LinkState ——
         allplay::LinkState st;
-        if (!rx.running())          st = allplay::LinkState::Error;
+        if (opt.wiredOn && !wiredReceiverUp) {
+            // Receiver 还没起不是"错误"，是"还在准备" —— 报 Error 会让启动页写"Error"，
+            // 把"手机锁着、等人点信任"说成故障。只有真失败了才报 Error。
+            st = (wiredTask.phase() == allplay::WiredPhase::Failed) ? allplay::LinkState::Error
+                                                                   : allplay::LinkState::Connecting;
+        }
+        else if (!rx.running())          st = allplay::LinkState::Error;
         else if (rx.sessionActive()) st = allplay::LinkState::Streaming;
         else if (rx.connecting())    st = allplay::LinkState::Connecting;
         else                         st = allplay::LinkState::WaitingPair;
@@ -588,6 +735,9 @@ int main(int argc, char** argv)
     std::printf("[host] 收尾：停核心…\n");
     std::fflush(stdout);
     btTask.stop();      // 触发线程 detach 掉（runBtTrigger 没有取消点，见 host/bt_task.cpp）
+    // 有线：先停接入任务（join pump；它每 200ms 查一次停止位），再停核心。
+    // 顺序不能反 —— pump 线程还攥着 iAP2 链路（Impl 里的 link），得让它先收手。
+    wiredTask.stop();
     rx.stop();          // 先停核心（join 屏幕流/音频流线程），再让 sink 析构
 #ifdef ALLPLAY_HAVE_FFMPEG
     // 音频不做"有没有声音"的自动判定（无头跑时设备是 dummy，听不见）；

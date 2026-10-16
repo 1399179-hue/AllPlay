@@ -79,6 +79,19 @@ void LinkEngine::start(uint64_t nowMs)
     state_ = State::Detecting;
     appendOutput(std::vector<uint8_t>(kMarker, kMarker + sizeof kMarker));
     markerDeadlineMs_ = nowMs + kMarkerResendMs;
+    // 主动发起（有线）：marker 只发这一次，紧接着自己进协商、开始发 SYN ——
+    // 不等对端 marker。有线这条路上对端不会先开口。
+    if (cfg_.initiator) enterNegotiating(nowMs);
+}
+
+/// 进协商态：停掉 marker 重发，开始发 SYN 并按 kSyncResendMs 重发（在 tick 里）。
+void LinkEngine::enterNegotiating(uint64_t nowMs)
+{
+    if (state_ == State::Dead) return;
+    state_ = State::Negotiating;
+    markerDeadlineMs_ = 0;
+    sendSynchronization();
+    syncDeadlineMs_ = nowMs + kSyncResendMs;
 }
 
 void LinkEngine::sendSynchronization()
@@ -130,6 +143,16 @@ size_t LinkEngine::peerMaxPayload() const
 {
     if (!peerSyncOk_ || peerMaxLength_ <= kHeaderBytes + kChecksumBytes) return 512;
     return peerMaxLength_ - kHeaderBytes - kChecksumBytes;
+}
+
+std::string LinkEngine::peerSummary() const
+{
+    if (!peerSyncOk_) return "（还没收到对端 SYN）";
+    return "maxOutgoing=" + std::to_string(peerMaxOutgoing_) +
+           " maxLength=" + std::to_string(peerMaxLength_) +
+           " 重传超时=" + std::to_string(peerRetransTimeoutMs_) + "ms" +
+           " maxRetrans=" + std::to_string(peerMaxRetransmissions_) +
+           " maxAcks=" + std::to_string(peerMaxAcks_);
 }
 
 bool LinkEngine::sendControl(const std::vector<uint8_t>& payload, uint64_t nowMs)
@@ -190,10 +213,7 @@ bool LinkEngine::parseOne(uint64_t nowMs)
         if (rx_.size() < sizeof kMarker) return false;
         if (std::equal(kMarker, kMarker + sizeof kMarker, rx_.begin())) {
             rx_.erase(rx_.begin(), rx_.begin() + sizeof kMarker);
-            state_ = State::Negotiating;
-            markerDeadlineMs_ = 0;
-            sendSynchronization();
-            syncDeadlineMs_ = nowMs + kSyncResendMs;
+            enterNegotiating(nowMs);
             return true;
         }
         // 不匹配：找下一个可能的 marker 起点（丢 1 字节重试）

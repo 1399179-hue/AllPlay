@@ -30,6 +30,13 @@ add_library(allplay_core STATIC
     iap2/wire.cpp
     iap2/link.cpp
     iap2/wireless_client.cpp
+    iap2/wired_link.cpp
+    usb/usbmux.cpp
+    usb/plist_xml.cpp
+    usb/tls_stream.cpp
+    usb/lockdown.cpp
+    usb/pair_record.cpp
+    usb/wired_control.cpp
     mfi/mfi_identity.cpp
     bt/bt_trigger.cpp
     crypto/hkdf.cpp
@@ -41,5 +48,6 @@ add_library(allplay_core STATIC
     crypto/aes_ctr.cpp
 )
 target_include_directories(allplay_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(allplay_core PUBLIC OpenSSL::Crypto Threads::Threads)
+# OpenSSL::SSL 是有线链路要的（lockdown 的 StartSession 之后原地升成 TLS，见 usb/tls_stream）
+target_link_libraries(allplay_core PUBLIC OpenSSL::Crypto OpenSSL::SSL Threads::Threads)
 target_compile_options(allplay_core PRIVATE -Wall -Wextra)

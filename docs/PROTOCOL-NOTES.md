@@ -12,6 +12,20 @@ iPhone ──(1) 蓝牙 RFCOMM / iAP2 bootstrap（触发+MFi+推配置）──�
        ◀─(3) 事件通道：HID/触摸/命令（加密，POST /command）──  我们
 ```
 
+**有线（USB）是另一条独立的接入路径**，走到 (2)(3) 之后与上面完全汇合：
+
+```
+iPhone ──(0) USB：切进 CarPlay 配置，打开 USBMUX 口 ─────────▶ 我们
+       ──(1') usbmux v2 → lockdown 配对 → 原地 TLS → carkit 服务流
+       ──(2') 该服务流上跑 iAP2：主机主动 marker+SYN → 识别 → MFi → 电源/订阅
+       ◀──(3') 0x4300 CarPlayAvailability ──────────────────── 我们
+       ──▶(4') 0x4301 CarPlayStartSession（报本端 IPv6 链路本地 + 端口）
+       ──(5') 手机照该地址连过来 → 汇入 (2)(3)
+```
+
+差别全在"谁先开口"和"地址谁定"：无线是**我们广播、手机找过来**；有线是**手机问、我们答**，
+地址由我们钉在内核 NCM 网卡上再报给它。详见 [§10](#10-有线usb接入2026-10-13)。
+
 ---
 
 ## 1. 蓝牙 / iAP2 触发（M2）
@@ -157,3 +171,85 @@ iPhone ──(1) 蓝牙 RFCOMM / iAP2 bootstrap（触发+MFi+推配置）──�
 ## 9. 来源与边界
 - 以上为**协议事实**整理（核查得出，2026-10-10）。
 - 本项目实现为**基于 DiPlay / xcertplay（GPL-3.0）的 C++ 重新实现**；依赖只用系统库。
+
+---
+
+## 10. 有线（USB）接入（2026-10-13）
+
+对照真机逐段验证得出，全部在 Linux + iPhone 上跑通（真机 3000 帧上屏、200 秒不掉线）。
+
+### 10.1 前置（Linux，缺一不可）
+
+- `sudo systemctl stop usbmuxd && sudo systemctl mask usbmuxd` —— USBMUX 口只能有一个主人。
+- `pkill -f gvfsd-gphoto2` —— 不然 gvfs 会抢着去挂载照片。
+- blacklist `apple_mfi_fastcharge`（`/etc/modprobe.d/`）—— 这个内核模块会把设备认走。
+- `/dev/bus/usb/*` 是 root 独占，**整个程序 `sudo` 跑**。`sudo` 会重置环境：
+  日志要 `sudo env ALLPLAY_LOG=…`，状态目录要显式给（否则 `HOME=/root`，本机身份另起一份，
+  手机每次都要重新配对）。
+
+### 10.2 USB 侧：切进 CarPlay 配置
+
+- iPhone 正常枚举出**一个**配置（PTP）。**解锁后**才报出 CarPlay 那个配置（真机实测 value=6）。
+  → 判据是 `bNumConfigurations <= 1`，**"这台手机没有 CarPlay 配置"多半是锁屏，不是线的问题**。
+- 该配置里认两个接口：**USBMUX 口**（iAP2 的载体，bulk in/out 包成 `IByteStream`）与
+  **NCM 控制/数据口**（交还给内核，别自己 detach）。接口号从描述符里读，不要写死。
+- 切换配置后设备会重枚举（bus/addr 变化），要等它回来再打开。
+
+### 10.3 控制面：三条迷你 TCP 连接
+
+手机那侧实现了一个 TCP 栈，所以成帧得自己来（`usbmux v2`：版本协商 + setup + 连接请求）。
+
+1. **明文 lockdown `:62078`** —— `SetValue(UntrustedHostBUID)` → `GetValue(DevicePublicKey)`
+   → `GetValue(WiFiAddress)` → `Pair`（**明文，不是 SRP**；SRP 是 AirPlay 那边的 pair-setup）。
+   报文是 **XML plist**（不是本项目 `core/bplist` 那套二进制），前面加 4 字节大端长度。配完即关。
+2. **同一条连接原地升 TLS** —— `StartSession` → 升级 → `StartService(com.apple.carkit.service)`。
+   这条**要一直开着**，它一断第三条也就废了。客户端身份是 **root 证书**，不是 host 那张。
+3. `StartService` 返回的端口 —— **新的连接**，可选再做一次 TLS。**这就是 iAP2 那条流。**
+   流上第一个字节就是 iAP2 链路帧，中间没有任何额外握手或封装。
+
+配对记录（HostID / SystemBUID / 证书）**目前每跑一次现造**，所以每次都要在手机上点一次"信任"；
+落一份 pair record 可以免掉。
+
+### 10.4 iAP2 链路：有线由**主机**发起
+
+`FF 55 02 00 EE 10`（6 字节裸 marker，**前面没有任何长度或封装**）之后：
+
+- **必须立刻自己发 SYN，并每 500ms 重发**，直到收到手机的 SYN。
+  只发 marker 的话手机**一声不吭**（真机实测干等 260 秒零字节）—— 无线那条路是手机先发 marker、
+  我们才进协商，照抄必死。
+- 链路参数（照 DiPlay 的 `WIRED_LINK_CONFIG`）：`maxOutgoing=4`、控制会话版本 2、**声明零确认**
+  （USB 这条道本身可靠）。
+
+识别 `0x1D01` 里的 **USBHostTransport 接口号**必须是 USBMUX 那个口的 `bInterfaceNumber`
+（真机 = 1），报错手机会直接拒（`0x1D03`）。链路 NORMAL 后要**立刻**做识别 —— 干等约 44 秒
+手机会把 USB 整个重置。
+
+### 10.5 媒体面：内核 `cdc_ncm`，不是我们
+
+切进 CarPlay 配置后内核自己绑 CDC-NCM 功能并建出一块真网卡（实测 `cdc_ncm 1-3:6.3 usb0: register …`）。
+**NTB16 / 以太网 / IPv6 全不用写**，AirPlay 直接绑上去即可。两个坑：
+
+- 内核在这块网卡上**不生成任何 IPv6 地址**（`addr_gen_mode=1`），要自己钉；而
+  NetworkManager 会把这根点对点链路当"有线连接"去要 DHCP（没有服务器），一直卡 connecting。
+  → `nmcli device set <if> managed no` → `ip link set up` → `ip addr add fe80::2/64 … nodad`。
+- 网卡名由 MAC 来（`enx…`），**不能写死**。按 USB `busnum`/`devnum` 反查
+  `/sys/class/net/*/device/../{busnum,devnum}`。
+- 链路本地地址 `bind()` **必须带 `sin6_scope_id`**，否则 EINVAL（报得像参数写错了）。
+
+### 10.6 `0x4300` / `0x4301`
+
+- `0x4300 CarPlayAvailability`：`group(0)`=有线、`group(1)`=无线、`group(2)`=themeAssets；
+  每组内 `u8(0)=可用否`、`str(1)=标识`。真机报有线可用（标识=手机 UDID）且无线可用（标识=Wi-Fi MAC）。
+- `0x4301 CarPlayStartSession`：`group(0)` 有线 —— 里面**每个地址一个 string 参数、重复 id 0**
+  （**不是字符串列表**，这里最容易搭错）；随后 `u32(2)=AirPlay 端口`、可选 `str(3)=deviceIdentifier`、
+  `str(4)=Ed25519 公钥 hex`、`str(5)=sourceVersion`。
+- 公钥必须是**持久化的那把**（`core::DeviceIdentity`）—— 手机后面 pair-verify 认的就是它。
+- 收到 `0x4300` 就回 `0x4301`，**不按 `available` 过滤**（DiPlay 也是收到就回，可不可用让手机自己判断）。
+- 报的地址**必须是 Receiver 实际绑定监听的那个**，端口同理。说一套自己监听另一套，
+  手机连上来第一件事就是对不上。
+
+### 10.7 一个"看着像网络故障"的坑
+
+控制面全绿、`/pair-verify` 过了、`RECORD` 了，然后手机每 2 秒 POST 一次 `/feedback`，
+**永远等不到画面**。根因不在网络：`SETUP` 里手机要屏幕流，我们没给 `dataPort`
+（`IVideoOutput` 为空时不建流），手机拿不到数据端口只能干等。

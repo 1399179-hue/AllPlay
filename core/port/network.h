@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace core {
 
@@ -31,6 +32,27 @@ public:
 
     /// 指定接口的 MAC（6 字节）。成功返回 true。
     virtual bool interfaceMAC(const std::string& ifname, uint8_t mac[6]) = 0;
+
+    // ---- 有线 CarPlay 的媒体面（内核 cdc_ncm）---------------------------------
+    // 有线这条道上手机不是连我们的 Wi-Fi，而是走 USB 上的 NCM 以太网。那张网卡
+    // 是**内核驱动挂出来的**，名字（enx…）不固定，得按 USB 设备反查。
+
+    /// 按 USB 设备的 bus/addr 找到它挂出来的网卡名。找不到返回空串。
+    /// 默认实现返回空 —— 平台没有这条路径（Android 走 VpnService，不是内核 NCM）。
+    virtual std::string interfaceForUsbDevice(int bus, int address)
+    {
+        (void)bus;
+        (void)address;
+        return {};
+    }
+
+    /// 指定接口的 IPv6 链路本地地址（不带 %zone 后缀）。没有返回空表。
+    /// 有线 0x4301 报给手机的就是它 —— DiPlay 那条路上等价于 config.linkLocal。
+    virtual std::vector<std::string> interfaceIPv6LinkLocal(const std::string& ifname)
+    {
+        (void)ifname;
+        return {};
+    }
 };
 
 /// MAC 6 字节 → "AA:BB:CC:DD:EE:FF"（纯格式，平台无关）
