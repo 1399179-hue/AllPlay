@@ -1,0 +1,196 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: C++ core (host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libssl-dev libavahi-client-dev libbluetooth-dev libdbus-1-dev libsdl2-dev
+      - name: Configure and build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+  android-kotlin:
+    name: Android Kotlin compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Compile Kotlin (no native build)
+        working-directory: android
+        run: gradle :app:compileDebugKotlin --stacktrace
+
+  android-apk:
+    name: Android APK (arm64 + armv7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;25.2.9519653 cmake;3.22.1'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # core 唯一三方依赖是 OpenSSL；Android 无系统 OpenSSL，按 ABI 交叉编译两份。
+      # CMake 约定：$OPENSSL_BASE_DIR/openssl-arm64 与 $OPENSSL_BASE_DIR/openssl-arm。
+      - name: Build OpenSSL for Android (arm64 + armv7)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz -o /tmp/openssl.tgz
+          tar xzf /tmp/openssl.tgz -C /tmp
+          NDK="${ANDROID_HOME}/ndk/25.2.9519653"
+          TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # OpenSSL 的 android-* 目标靠 ANDROID_NDK_ROOT 定位 NDK clang；
+          # 不设它会退回找 aarch64-linux-android-gcc（NDK 早已不提供）。
+          export ANDROID_NDK_ROOT="${NDK}"
+          export ANDROID_NDK_HOME="${NDK}"
+          for target in "android-arm64 arm64 21" "android-arm arm 19"; do
+            set -- $target
+            cfg="$1"; out="$2"; api="$3"
+            echo "=== OpenSSL ${cfg} -> openssl-${out} (API ${api}) ==="
+            rm -rf "/tmp/openssl-build-${out}"
+            cp -r /tmp/openssl-3.0.15 "/tmp/openssl-build-${out}"
+            (
+              cd "/tmp/openssl-build-${out}"
+              PATH="${TOOLCHAIN}:$PATH" ./Configure "${cfg}" -D__ANDROID_API__="${api}" \
+                --prefix="$GITHUB_WORKSPACE/openssl-${out}" no-tests no-shared
+              PATH="${TOOLCHAIN}:$PATH" make -j"$(nproc)"
+              make install_sw
+            )
+          done
+          ls -l "$GITHUB_WORKSPACE"/openssl-arm64/lib/libcrypto.a "$GITHUB_WORKSPACE"/openssl-arm/lib/libcrypto.a
+
+      # MFi 身份不提交到公开仓库：优先用仓库 secrets，其次从公开的 DiPlay release APK 里取
+      # （与 DiPlay 自己的构建做法一致），最后注入 assets/offline-mfi，首启自动释放到 files/identity。
+      - name: Prepare MFi identity assets
+        env:
+          PK8_B64: ${{ secrets.MFI_IDENTITY_PK8_B64 }}
+          P7B_B64: ${{ secrets.MFI_CERTIFICATE_P7B_B64 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/auth-assets/offline-mfi"
+          mkdir -p "${dest}"
+          if [[ -n "${PK8_B64:-}" && -n "${P7B_B64:-}" ]]; then
+            echo "Identity source: repository secrets"
+            printf '%s' "${PK8_B64}" | base64 --decode > "${dest}/identity.pk8"
+            printf '%s' "${P7B_B64}" | base64 --decode > "${dest}/certificate.p7b"
+          else
+            echo "Identity source: public DiPlay release APK"
+            api="https://api.github.com/repos/shihabal3amri/DiPlay/releases?per_page=20"
+            url="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                      -H "Accept: application/vnd.github+json" "${api}" 2>/dev/null \
+                    | jq -r '[.[] | select(.draft | not)] | .[0].assets[] | select(.name | endswith(".apk")) | .browser_download_url' \
+                    | head -1 || true)"
+            if [[ -z "${url}" || "${url}" == "null" ]]; then
+              echo "::error::No DiPlay release APK found; add MFI_IDENTITY_PK8_B64 / MFI_CERTIFICATE_P7B_B64 secrets."
+              exit 1
+            fi
+            echo "Downloading ${url}"
+            curl -fsSL --retry 3 --retry-delay 5 "${url}" -o "${RUNNER_TEMP}/diplay.apk"
+            unzip -o -q "${RUNNER_TEMP}/diplay.apk" 'assets/offline-mfi/*' -d "${RUNNER_TEMP}/diplay"
+            cp "${RUNNER_TEMP}/diplay/assets/offline-mfi/identity.pk8" "${dest}/identity.pk8"
+            cp "${RUNNER_TEMP}/diplay/assets/offline-mfi/certificate.p7b" "${dest}/certificate.p7b"
+          fi
+          ls -l "${dest}"
+          echo "ALLPLAY_AUTH_ASSETS_DIR=${RUNNER_TEMP}/auth-assets" >> "$GITHUB_ENV"
+
+      # 固定 release 签名：没有 secret 时退回临时 key（新包无法覆盖旧包，会打警告）。
+      - name: Prepare the release signing key
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_KEYSTORE_BASE64:-}" ]]; then
+            echo "::warning::No RELEASE_KEYSTORE_BASE64 secret. Signing with an ephemeral key: uninstall the previous build before installing this one."
+            keystore="${RUNNER_TEMP}/allplay-release.jks"
+            keytool -genkeypair -keystore "${keystore}" \
+              -storepass allplay-build -keypass allplay-build \
+              -alias allplay -keyalg RSA -keysize 2048 -validity 30 \
+              -dname "CN=AllPlay build"
+            {
+              echo "ANDROID_KEYSTORE_PATH=${keystore}"
+              echo "ANDROID_KEYSTORE_PASSWORD=allplay-build"
+              echo "ANDROID_KEY_ALIAS=allplay"
+              echo "ANDROID_KEY_PASSWORD=allplay-build"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for name in ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::RELEASE_KEYSTORE_BASE64 is set but ${name} is not"
+              exit 1
+            fi
+          done
+          keystore="${RUNNER_TEMP}/allplay-release.jks"
+          printf '%s' "${RELEASE_KEYSTORE_BASE64}" | base64 --decode > "${keystore}"
+          keytool -list -keystore "${keystore}" \
+            -storepass "${ANDROID_KEYSTORE_PASSWORD}" -alias "${ANDROID_KEY_ALIAS}" > /dev/null
+          {
+            echo "ANDROID_KEYSTORE_PATH=${keystore}"
+            echo "ANDROID_KEYSTORE_PASSWORD=${ANDROID_KEYSTORE_PASSWORD}"
+            echo "ANDROID_KEY_ALIAS=${ANDROID_KEY_ALIAS}"
+            echo "ANDROID_KEY_PASSWORD=${ANDROID_KEY_PASSWORD}"
+          } >> "$GITHUB_ENV"
+          echo "Signing with the fixed release key (alias ${ANDROID_KEY_ALIAS})."
+
+      - name: Assemble release APK
+        working-directory: android
+        env:
+          OPENSSL_BASE_DIR: ${{ github.workspace }}
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Verify and upload the APK
+        run: |
+          set -euo pipefail
+          apk="$(find android/app/build/outputs/apk -type f -name '*release*.apk' -print -quit)"
+          if [[ -z "${apk}" ]]; then
+            echo "::error::No release APK was produced"
+            exit 1
+          fi
+          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify --print-certs "${apk}"
+          echo "--- artifact ---"
+          ls -l "${apk}"
+          sha256sum "${apk}"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: allplay-release-${{ github.sha }}
+          path: android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30

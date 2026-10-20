@@ -58,6 +58,10 @@ public:
     /// 喂一个解密后的 RTP 载荷（一帧音频数据）。sample = RTP 时间戳（供重排/时钟）。
     virtual void feed(const uint8_t* payload, size_t len, uint32_t sample) = 0;
 
+    /// 丢包遮蔽：插入 frames 个采样帧的静音，保持时间线连续（避免跳变/爆音）。
+    /// 默认空实现，平台可覆写；LPCM 无帧概念，核心不会调用。
+    virtual void conceal(size_t /*frames*/) {}
+
     /// 流结束/重建时重置。
     virtual void reset() = 0;
 };

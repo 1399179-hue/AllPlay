@@ -50,6 +50,18 @@ private:
     /// RTP 乱序重排：按序号缓冲少量包再按序吐出（AAC/Opus 解码对乱序敏感）。
     void deliver(const uint8_t* payload, size_t len, uint32_t sample, uint16_t seq);
 
+    /// 按序吐出连续包，并清掉缺口计时。
+    void flushContiguous();
+
+    /// 缺口超过宽限期就补静音（conceal），而不是一直等或整段跳变。
+    void maybeConceal(uint64_t nowNs);
+
+    /// 补 packets 个包的静音（上限 kMaxConcealPackets，避免一次补太久）。
+    void concealPackets(uint64_t packets);
+
+    /// 每种编码一包的采样帧数；LPCM 返回 0（不遮蔽）。
+    size_t frameSamples() const;
+
     std::unique_ptr<core::IUdpSocket> dataSock_, controlSock_;
     std::array<uint8_t, 32> key_{};
     AudioCodec codec_;
@@ -66,6 +78,7 @@ private:
     uint16_t lastRaw_ = 0;              // 上一个原始序号（算回绕/乱序增量用）
     uint64_t lastExt_ = 0;
     bool     haveSeq_ = false;
+    uint64_t gapSinceNs_ = 0;           // 缺口开始的时间（0 = 当前无缺口）
 };
 
 }  // namespace core::airplay
