@@ -53,8 +53,15 @@ class AudioSink(private val context: Context? = null) {
     private var focusHeld = false
     private var focusDucked = false
 
+    /**
+     * configure/reset 在会话线程跑，feed/conceal 在音频线程跑。会话切换时若不互斥，
+     * feed 会拿到已被 release 的 MediaCodec（IllegalStateException: Invalid to call at
+     * Released state）——真机上 AAC→Opus 切换必现。
+     */
+    private val lock = Any()
+
     /// codec: 0=AAC-LC, 1=Opus, 2=LPCM
-    fun configure(codecType: Int, sampleRate: Int, channels: Int) {
+    fun configure(codecType: Int, sampleRate: Int, channels: Int) = synchronized(lock) {
         this.sampleRate = sampleRate
         this.channels = channels
         release()
@@ -84,7 +91,7 @@ class AudioSink(private val context: Context? = null) {
         Log.i("AllPlay", "AudioSink 配置 $mime ${sampleRate}Hz ${channels}ch")
     }
 
-    fun feed(payload: ByteArray, sample: Int) {
+    fun feed(payload: ByteArray, sample: Int) = synchronized(lock) {
         if (!prioritySet) {
             prioritySet = true
             // 音频线程：车机开 360 摄像头时默认优先级会被挤掉（DiPlay #737 同款修复）
@@ -100,11 +107,20 @@ class AudioSink(private val context: Context? = null) {
 
         // 不再「一次 100 ms 拿不到就丢帧」：轮询 10×10 ms，期间抽干输出，
         // 让解码器腾出输入缓冲（对应 DiPlay 的 DecoderInputPump + inputWaitRetriesTotal）。
-        var idx = c.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        // 任何 IllegalStateException 都表示会话正在重建、codec 已释放：安静放弃这一帧。
+        var idx = try {
+            c.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        } catch (_: IllegalStateException) {
+            return
+        }
         var attempt = 1
         while (idx < 0 && attempt < INPUT_ATTEMPTS) {
             drain()
-            idx = c.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            idx = try {
+                c.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            } catch (_: IllegalStateException) {
+                return
+            }
             attempt++
         }
         if (!firstFeedLogged) {
@@ -128,8 +144,7 @@ class AudioSink(private val context: Context? = null) {
             adtsWrap(payload)
         } else payload
         buf.put(data)
-        // presentationTimeUs 传 RTP 时间戳换算值：同一流内保持相对关系即可（AudioTrack 按写入顺序播）
-        c.queueInputBuffer(idx, 0, data.size, 0, 0)
+        runCatching { c.queueInputBuffer(idx, 0, data.size, 0, 0) }.onFailure { return }
         drain()
     }
 
@@ -137,7 +152,7 @@ class AudioSink(private val context: Context? = null) {
      * 丢包遮蔽：写 frames 个采样帧的静音，保持时间线连续。
      * C++ 重排层在缺口超过宽限期或缓冲溢出时调用。
      */
-    fun conceal(frames: Int) {
+    fun conceal(frames: Int) = synchronized(lock) {
         if (frames <= 0) return
         val bytes = frames * channels * 2
         writePcm(ByteArray(bytes))
@@ -146,7 +161,7 @@ class AudioSink(private val context: Context? = null) {
             Log.i("AllPlay", "音频补静音 frames=$frames 累计=$concealFrames")
     }
 
-    fun reset() { release() }
+    fun reset() = synchronized(lock) { release() }
 
     private fun writePcm(pcm: ByteArray) {
         val t = track ?: return
@@ -163,7 +178,12 @@ class AudioSink(private val context: Context? = null) {
         val info = MediaCodec.BufferInfo()
         while (true) {
             // 非阻塞：10s 超时会卡死整条音频线程（解码器没吐帧时 UDP 收包停滞→丢包→卡顿）
-            val out = c.dequeueOutputBuffer(info, 0)
+            // 会话重建时 codec 可能已被释放：IllegalStateException 直接放弃本轮。
+            val out = try {
+                c.dequeueOutputBuffer(info, 0)
+            } catch (_: IllegalStateException) {
+                return
+            }
             if (!firstDrainLogged) {
                 firstDrainLogged = true
                 Log.i("AllPlay", "dequeueOutputBuffer 返回=$out")
