@@ -80,7 +80,7 @@ jobs:
             (
               cd "/tmp/openssl-build-${out}"
               PATH="${TOOLCHAIN}:$PATH" ./Configure "${cfg}" -D__ANDROID_API__="${api}" \
-                --prefix="$GITHUB_WORKSPACE/openssl-${out}" no-tests no-apps no-docs no-shared
+                --prefix="$GITHUB_WORKSPACE/openssl-${out}" no-tests no-shared
               PATH="${TOOLCHAIN}:$PATH" make -j"$(nproc)"
               make install_sw
             )
