@@ -44,7 +44,7 @@ class AllPlaySessionService : Service() {
         bt = BluetoothService()
         mdns = MdnsService(this)
         video = MediaCodecSink()
-        audio = AudioSink()
+        audio = AudioSink(this)
         hotspot = HotspotManager(this)
         // 后台保活：拿部分唤醒锁，防止退后台后 CPU/网络休眠导致 CarPlay 断连
         val pm = getSystemService(POWER_SERVICE) as PowerManager

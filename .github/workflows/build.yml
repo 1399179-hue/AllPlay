@@ -1,0 +1,102 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: C++ core (host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libssl-dev libavahi-client-dev libbluetooth-dev libdbus-1-dev libsdl2-dev
+      - name: Configure and build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+  android-kotlin:
+    name: Android Kotlin compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Compile Kotlin (no native build)
+        working-directory: android
+        run: gradle :app:compileDebugKotlin --stacktrace
+
+  android-apk:
+    name: Android APK (arm64 + armv7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;25.2.9519653 cmake;3.22.1'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # core 唯一三方依赖是 OpenSSL；Android 无系统 OpenSSL，按 ABI 交叉编译两份。
+      # CMake 约定：$OPENSSL_BASE_DIR/openssl-arm64 与 $OPENSSL_BASE_DIR/openssl-arm。
+      - name: Build OpenSSL for Android (arm64 + armv7)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz -o /tmp/openssl.tgz
+          tar xzf /tmp/openssl.tgz -C /tmp
+          NDK="${ANDROID_HOME}/ndk/25.2.9519653"
+          TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for target in "android-arm64 arm64 21" "android-arm arm 19"; do
+            set -- $target
+            cfg="$1"; out="$2"; api="$3"
+            echo "=== OpenSSL ${cfg} -> openssl-${out} (API ${api}) ==="
+            rm -rf "/tmp/openssl-build-${out}"
+            cp -r /tmp/openssl-3.0.15 "/tmp/openssl-build-${out}"
+            (
+              cd "/tmp/openssl-build-${out}"
+              PATH="${TOOLCHAIN}:$PATH" ./Configure "${cfg}" -D__ANDROID_API__="${api}" \
+                --prefix="$GITHUB_WORKSPACE/openssl-${out}" no-tests no-apps no-docs no-shared
+              PATH="${TOOLCHAIN}:$PATH" make -j"$(nproc)"
+              make install_sw
+            )
+          done
+          ls -l "$GITHUB_WORKSPACE"/openssl-arm64/lib/libcrypto.a "$GITHUB_WORKSPACE"/openssl-arm/lib/libcrypto.a
+
+      - name: Assemble debug APK
+        working-directory: android
+        env:
+          OPENSSL_BASE_DIR: ${{ github.workspace }}
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: allplay-debug-${{ github.sha }}
+          path: android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30

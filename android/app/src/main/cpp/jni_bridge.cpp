@@ -346,6 +346,18 @@ public:
         if (attached) g_vm->DetachCurrentThread();
     }
 
+    void conceal(size_t frames) override
+    {
+        bool attached = false;
+        JNIEnv* env = envOf(&attached);
+        if (!env || !g_audio) return;
+        jclass cls = env->GetObjectClass(g_audio);
+        jmethodID m = env->GetMethodID(cls, "conceal", "(I)V");
+        env->DeleteLocalRef(cls);
+        if (m) env->CallVoidMethod(g_audio, m, jint(frames));
+        if (attached) g_vm->DetachCurrentThread();
+    }
+
     void reset() override
     {
         bool attached = false;

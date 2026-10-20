@@ -216,6 +216,12 @@ public:
         }
         int zero = 0;
         ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+        // 弱 Wi-Fi 突发时系统默认接收缓冲（约 200 KB 且被内核 rmem 上限压着）会先满、先于
+        // 应用丢包，表现为音乐每隔几秒卡一下。显式放大到 512 KiB（受 net.core.rmem_max 约束）。
+        int rcvbuf = 512 * 1024;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+        int sndbuf = 256 * 1024;
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
         struct sockaddr_in6 addr{};
         addr.sin6_family = AF_INET6;
         addr.sin6_port   = htons(port);

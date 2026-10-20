@@ -5,6 +5,7 @@
 #include "crypto/hkdf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace core::airplay {
@@ -13,7 +14,21 @@ namespace {
 constexpr size_t kRtpHeader  = 12;
 constexpr size_t kNonceTail  = 8;
 constexpr size_t kMaxDatagram = 4096;
-constexpr int    kTimeoutMs  = 1000;
+// 短超时：缺口要能被及时补静音，而不是等 1 s 才发现。
+constexpr int    kTimeoutMs  = 20;
+// 重排缓冲上限：12 包 ≈ 256 ms（AAC 48 kHz 每包 21.3 ms）。
+constexpr size_t kMaxJitter  = 12;
+// 缺口宽限期：给乱序/网络抖动留 60 ms，超过就补静音继续。
+constexpr uint64_t kGapGraceNs = 60ull * 1000 * 1000;
+// 一次最多补 8 包（≈170 ms），避免长时间中断后补出几秒静音。
+constexpr uint64_t kMaxConcealPackets = 8;
+
+uint64_t nowNs()
+{
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
 }  // namespace
 
 AudioStream::AudioStream(std::function<std::unique_ptr<core::IUdpSocket>()> makeUdp,
@@ -61,7 +76,10 @@ void AudioStream::run()
     uint8_t buf[kMaxDatagram];
     while (!stop_.load()) {
         const int n = dataSock_->recv(buf, sizeof buf, kTimeoutMs);
-        if (n <= 0) continue;   // 超时/关闭
+        if (n <= 0) {   // 超时/关闭：仍要检查缺口，否则丢包后会一直等下去
+            maybeConceal(nowNs());
+            continue;
+        }
 
         // wire = [12B RTP 头][密文][16B tag][8B nonce]
         if (size_t(n) < kRtpHeader + 16 + kNonceTail) continue;
@@ -93,7 +111,65 @@ void AudioStream::run()
             }
         }
         deliver(pt.data(), pt.size(), sample, seq);
+        maybeConceal(nowNs());
     }
+}
+
+size_t AudioStream::frameSamples() const
+{
+    switch (codec_) {
+        case AudioCodec::AAC_LC: return 1024;   // AAC 一帧 1024 采样
+        case AudioCodec::OPUS:   return 960;    // Opus 20 ms @48 kHz
+        default:                 return 0;      // LPCM 无帧概念，不遮蔽
+    }
+}
+
+void AudioStream::concealPackets(uint64_t packets)
+{
+    if (!output_ || packets == 0) return;
+    const size_t fs = frameSamples();
+    if (!fs) return;
+    const uint64_t n = std::min<uint64_t>(packets, kMaxConcealPackets);
+    for (uint64_t i = 0; i < n; ++i) output_->conceal(fs);
+    static uint64_t concealEvents = 0;
+    if (++concealEvents % 100 == 1)
+        LOG_INFO("音频丢包遮蔽：本次补 %llu 包静音（累计 %llu 次）",
+                 (unsigned long long)n, (unsigned long long)concealEvents);
+}
+
+void AudioStream::flushContiguous()
+{
+    while (!pending_.empty() && pending_.begin()->first == nextSeq_) {
+        auto it = pending_.begin();
+        if (output_) output_->feed(it->second.payload.data(), it->second.payload.size(), it->second.sample);
+        pending_.erase(it);
+        ++nextSeq_;
+    }
+    gapSinceNs_ = 0;
+}
+
+void AudioStream::maybeConceal(uint64_t now)
+{
+    if (pending_.empty()) {
+        gapSinceNs_ = 0;
+        return;
+    }
+    const uint64_t head = pending_.begin()->first;
+    if (head <= nextSeq_) {   // 已经有连续包了，顺出即可
+        flushContiguous();
+        return;
+    }
+    if (gapSinceNs_ == 0) {   // 缺口刚开始，先等宽限期（乱序包可能马上到）
+        gapSinceNs_ = now;
+        return;
+    }
+    if (now - gapSinceNs_ < kGapGraceNs) return;
+
+    // 宽限期已过：补齐静音，时间线继续，而不是一直卡住或整段跳变
+    concealPackets(head - nextSeq_);
+    nextSeq_ = head;
+    gapSinceNs_ = 0;
+    flushContiguous();
 }
 
 void AudioStream::deliver(const uint8_t* payload, size_t len, uint32_t sample, uint16_t seq)
@@ -112,21 +188,16 @@ void AudioStream::deliver(const uint8_t* payload, size_t len, uint32_t sample, u
 
     pending_[lastExt_] = Pkt{std::vector<uint8_t>(payload, payload + len), sample};
 
-    // 按序吐出连续的包
-    while (!pending_.empty() && pending_.begin()->first == nextSeq_) {
-        auto it = pending_.begin();
-        if (output_) output_->feed(it->second.payload.data(), it->second.payload.size(), it->second.sample);
-        pending_.erase(it);
-        ++nextSeq_;
-    }
+    // 先把能按序吐出的都吐掉
+    flushContiguous();
 
-    // 防缓冲无限增长（缺一个包就一直等）：超过阈值强制吐最旧的，接受一次小跳变
-    constexpr size_t kMaxJitter = 8;   // ~170ms（48kHz AAC 每包 21.3ms）
+    // 防缓冲无限增长：丢最旧的，但用静音补齐被跳过的那段，避免可闻的跳变/爆音
     while (pending_.size() > kMaxJitter) {
-        auto it = pending_.begin();
-        if (output_) output_->feed(it->second.payload.data(), it->second.payload.size(), it->second.sample);
-        nextSeq_ = it->first + 1;
-        pending_.erase(it);
+        const uint64_t head = pending_.begin()->first;
+        concealPackets(head - nextSeq_);
+        nextSeq_ = head + 1;
+        pending_.erase(pending_.begin());
+        flushContiguous();
     }
 }
 
