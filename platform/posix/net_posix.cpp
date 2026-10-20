@@ -469,6 +469,12 @@ public:
         std::vector<std::string> out;
         if (ifname.empty()) return out;
 
+#if defined(__ANDROID__) && __ANDROID_API__ < 24
+        // Android 4.4（API<24）没有 getifaddrs/freeifaddrs（同 enumerateIPv4 的说明）。
+        // IPv6 link-local 枚举只用于有线 NCM 场景，无线音频路径不需要，返回空即可。
+        (void)ifname;
+        return out;
+#else
         struct ifaddrs* head = nullptr;
         if (getifaddrs(&head) != 0) return out;
         for (struct ifaddrs* ifa = head; ifa; ifa = ifa->ifa_next) {
@@ -482,6 +488,7 @@ public:
         }
         freeifaddrs(head);
         return out;
+#endif
     }
 };
 
