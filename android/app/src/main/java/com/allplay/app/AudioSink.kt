@@ -61,7 +61,7 @@ class AudioSink(private val context: Context? = null) {
     private val lock = Any()
 
     /// codec: 0=AAC-LC, 1=Opus, 2=LPCM
-    fun configure(codecType: Int, sampleRate: Int, channels: Int) = synchronized(lock) {
+    fun configure(codecType: Int, sampleRate: Int, channels: Int): Unit = synchronized(lock) {
         this.sampleRate = sampleRate
         this.channels = channels
         release()
@@ -91,7 +91,7 @@ class AudioSink(private val context: Context? = null) {
         Log.i("AllPlay", "AudioSink 配置 $mime ${sampleRate}Hz ${channels}ch")
     }
 
-    fun feed(payload: ByteArray, sample: Int) = synchronized(lock) {
+    fun feed(payload: ByteArray, sample: Int): Unit = synchronized(lock) {
         if (!prioritySet) {
             prioritySet = true
             // 音频线程：车机开 360 摄像头时默认优先级会被挤掉（DiPlay #737 同款修复）
@@ -152,7 +152,7 @@ class AudioSink(private val context: Context? = null) {
      * 丢包遮蔽：写 frames 个采样帧的静音，保持时间线连续。
      * C++ 重排层在缺口超过宽限期或缓冲溢出时调用。
      */
-    fun conceal(frames: Int) = synchronized(lock) {
+    fun conceal(frames: Int): Unit = synchronized(lock) {
         if (frames <= 0) return
         val bytes = frames * channels * 2
         writePcm(ByteArray(bytes))
@@ -161,7 +161,7 @@ class AudioSink(private val context: Context? = null) {
             Log.i("AllPlay", "音频补静音 frames=$frames 累计=$concealFrames")
     }
 
-    fun reset() = synchronized(lock) { release() }
+    fun reset(): Unit = synchronized(lock) { release() }
 
     private fun writePcm(pcm: ByteArray) {
         val t = track ?: return
