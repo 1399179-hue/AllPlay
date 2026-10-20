@@ -71,6 +71,10 @@ jobs:
           tar xzf /tmp/openssl.tgz -C /tmp
           NDK="${ANDROID_HOME}/ndk/25.2.9519653"
           TOOLCHAIN="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # OpenSSL 的 android-* 目标靠 ANDROID_NDK_ROOT 定位 NDK clang；
+          # 不设它会退回找 aarch64-linux-android-gcc（NDK 早已不提供）。
+          export ANDROID_NDK_ROOT="${NDK}"
+          export ANDROID_NDK_HOME="${NDK}"
           for target in "android-arm64 arm64 21" "android-arm arm 19"; do
             set -- $target
             cfg="$1"; out="$2"; api="$3"
