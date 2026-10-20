@@ -76,7 +76,34 @@ class AllPlaySessionService : Service() {
         return if (portraitMode) small to big else big to small
     }
 
+    /**
+     * 首次启动把随包发布的 MFi 身份从 assets/offline-mfi 释放到 files/identity。
+     *
+     * 身份文件不提交到公开仓库，由构建时（ALLPLAY_AUTH_ASSETS_DIR）注入 assets。
+     * 手工放进 files/identity 的旧文件优先保留，不会被覆盖。
+     */
+    private fun ensureIdentityFromAssets() {
+        val dir = java.io.File(filesDir, "identity")
+        val pk8 = java.io.File(dir, "identity.pk8")
+        val p7b = java.io.File(dir, "certificate.p7b")
+        if (pk8.exists() && p7b.exists()) return
+        runCatching {
+            dir.mkdirs()
+            for (name in listOf("identity.pk8", "certificate.p7b")) {
+                val target = java.io.File(dir, name)
+                if (target.exists()) continue
+                assets.open("offline-mfi/$name").use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+            }
+            android.util.Log.i("AllPlay", "MFi 身份已从 assets 释放到 ${dir.absolutePath}")
+        }.onFailure {
+            android.util.Log.w("AllPlay", "assets 无 MFi 身份（${it.message}）：需手工放 identity.pk8/certificate.p7b")
+        }
+    }
+
     private fun startNative(restart: Boolean = false) {
+        ensureIdentityFromAssets()
         val (w, h) = resolutionForOrientation()
         nativeWidth = w; nativeHeight = h
         val stateDir = filesDir.absolutePath

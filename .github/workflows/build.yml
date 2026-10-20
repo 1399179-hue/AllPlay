@@ -91,16 +91,106 @@ jobs:
           done
           ls -l "$GITHUB_WORKSPACE"/openssl-arm64/lib/libcrypto.a "$GITHUB_WORKSPACE"/openssl-arm/lib/libcrypto.a
 
-      - name: Assemble debug APK
+      # MFi 身份不提交到公开仓库：优先用仓库 secrets，其次从公开的 DiPlay release APK 里取
+      # （与 DiPlay 自己的构建做法一致），最后注入 assets/offline-mfi，首启自动释放到 files/identity。
+      - name: Prepare MFi identity assets
+        env:
+          PK8_B64: ${{ secrets.MFI_IDENTITY_PK8_B64 }}
+          P7B_B64: ${{ secrets.MFI_CERTIFICATE_P7B_B64 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/auth-assets/offline-mfi"
+          mkdir -p "${dest}"
+          if [[ -n "${PK8_B64:-}" && -n "${P7B_B64:-}" ]]; then
+            echo "Identity source: repository secrets"
+            printf '%s' "${PK8_B64}" | base64 --decode > "${dest}/identity.pk8"
+            printf '%s' "${P7B_B64}" | base64 --decode > "${dest}/certificate.p7b"
+          else
+            echo "Identity source: public DiPlay release APK"
+            api="https://api.github.com/repos/shihabal3amri/DiPlay/releases?per_page=20"
+            url="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                      -H "Accept: application/vnd.github+json" "${api}" 2>/dev/null \
+                    | jq -r '[.[] | select(.draft | not)] | .[0].assets[] | select(.name | endswith(".apk")) | .browser_download_url' \
+                    | head -1 || true)"
+            if [[ -z "${url}" || "${url}" == "null" ]]; then
+              echo "::error::No DiPlay release APK found; add MFI_IDENTITY_PK8_B64 / MFI_CERTIFICATE_P7B_B64 secrets."
+              exit 1
+            fi
+            echo "Downloading ${url}"
+            curl -fsSL --retry 3 --retry-delay 5 "${url}" -o "${RUNNER_TEMP}/diplay.apk"
+            unzip -o -q "${RUNNER_TEMP}/diplay.apk" 'assets/offline-mfi/*' -d "${RUNNER_TEMP}/diplay"
+            cp "${RUNNER_TEMP}/diplay/assets/offline-mfi/identity.pk8" "${dest}/identity.pk8"
+            cp "${RUNNER_TEMP}/diplay/assets/offline-mfi/certificate.p7b" "${dest}/certificate.p7b"
+          fi
+          ls -l "${dest}"
+          echo "ALLPLAY_AUTH_ASSETS_DIR=${RUNNER_TEMP}/auth-assets" >> "$GITHUB_ENV"
+
+      # 固定 release 签名：没有 secret 时退回临时 key（新包无法覆盖旧包，会打警告）。
+      - name: Prepare the release signing key
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_KEYSTORE_BASE64:-}" ]]; then
+            echo "::warning::No RELEASE_KEYSTORE_BASE64 secret. Signing with an ephemeral key: uninstall the previous build before installing this one."
+            keystore="${RUNNER_TEMP}/allplay-release.jks"
+            keytool -genkeypair -keystore "${keystore}" \
+              -storepass allplay-build -keypass allplay-build \
+              -alias allplay -keyalg RSA -keysize 2048 -validity 30 \
+              -dname "CN=AllPlay build"
+            {
+              echo "ANDROID_KEYSTORE_PATH=${keystore}"
+              echo "ANDROID_KEYSTORE_PASSWORD=allplay-build"
+              echo "ANDROID_KEY_ALIAS=allplay"
+              echo "ANDROID_KEY_PASSWORD=allplay-build"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for name in ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::RELEASE_KEYSTORE_BASE64 is set but ${name} is not"
+              exit 1
+            fi
+          done
+          keystore="${RUNNER_TEMP}/allplay-release.jks"
+          printf '%s' "${RELEASE_KEYSTORE_BASE64}" | base64 --decode > "${keystore}"
+          keytool -list -keystore "${keystore}" \
+            -storepass "${ANDROID_KEYSTORE_PASSWORD}" -alias "${ANDROID_KEY_ALIAS}" > /dev/null
+          {
+            echo "ANDROID_KEYSTORE_PATH=${keystore}"
+            echo "ANDROID_KEYSTORE_PASSWORD=${ANDROID_KEYSTORE_PASSWORD}"
+            echo "ANDROID_KEY_ALIAS=${ANDROID_KEY_ALIAS}"
+            echo "ANDROID_KEY_PASSWORD=${ANDROID_KEY_PASSWORD}"
+          } >> "$GITHUB_ENV"
+          echo "Signing with the fixed release key (alias ${ANDROID_KEY_ALIAS})."
+
+      - name: Assemble release APK
         working-directory: android
         env:
           OPENSSL_BASE_DIR: ${{ github.workspace }}
-        run: gradle :app:assembleDebug --stacktrace
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Verify and upload the APK
+        run: |
+          set -euo pipefail
+          apk="$(find android/app/build/outputs/apk -type f -name '*release*.apk' -print -quit)"
+          if [[ -z "${apk}" ]]; then
+            echo "::error::No release APK was produced"
+            exit 1
+          fi
+          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify --print-certs "${apk}"
+          echo "--- artifact ---"
+          ls -l "${apk}"
+          sha256sum "${apk}"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: allplay-debug-${{ github.sha }}
+          name: allplay-release-${{ github.sha }}
           path: android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 30

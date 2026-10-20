@@ -19,6 +19,7 @@
 
 #include <android/log.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -46,6 +47,9 @@ jobject g_audio = nullptr;   // AudioSink
 std::unique_ptr<core::airplay::Receiver> g_receiver;
 core::PlatformServices g_services;
 core::airplay::ReceiverConfig g_cfg;
+
+/// nativeStop 置位，让 detach 的蓝牙触发线程自己退出（它不能再碰已被销毁的对象）。
+std::atomic<bool> g_btTriggerStop{false};
 
 /// 拿当前线程的 JNIEnv（core 线程要 attach）。
 JNIEnv* envOf(bool* attached)
@@ -83,6 +87,7 @@ public:
 
     int read(uint8_t* buf, size_t n, int timeoutMs) override
     {
+        if (closed_.load()) return -1;   // 已被 nativeStop/重连关闭：当作断开，绝不碰已释放对象
         bool attached = false;
         JNIEnv* env = envOf(&attached);
         if (!env || !g_bt) return -1;
@@ -90,7 +95,7 @@ public:
         jmethodID m = env->GetMethodID(cls, "read", "(III)[B");
         env->DeleteLocalRef(cls);
         if (!m) return -1;
-        auto arr = static_cast<jbyteArray>(env->CallObjectMethod(g_bt, m, jint(handle_),
+        auto arr = static_cast<jbyteArray>(env->CallObjectMethod(g_bt, m, jint(handle_.load()),
                                                                  jint(n), jint(timeoutMs)));
         if (!arr) { if (attached) g_vm->DetachCurrentThread(); return -1; }   // null=断开
         const jsize len = env->GetArrayLength(arr);
@@ -103,6 +108,7 @@ public:
 
     bool writeAll(const uint8_t* buf, size_t n) override
     {
+        if (closed_.load()) return false;
         bool attached = false;
         JNIEnv* env = envOf(&attached);
         if (!env || !g_bt) return false;
@@ -112,7 +118,7 @@ public:
         if (!m) return false;
         jbyteArray arr = env->NewByteArray(jsize(n));
         if (n) env->SetByteArrayRegion(arr, 0, jsize(n), reinterpret_cast<const jbyte*>(buf));
-        const bool ok = env->CallBooleanMethod(g_bt, m, jint(handle_), arr);
+        const bool ok = env->CallBooleanMethod(g_bt, m, jint(handle_.load()), arr);
         if (arr) env->DeleteLocalRef(arr);
         if (attached) g_vm->DetachCurrentThread();
         return ok;
@@ -120,20 +126,22 @@ public:
 
     void close() override
     {
-        if (handle_ < 0) return;
+        if (closed_.exchange(true)) return;   // 幂等
+        const int handle = handle_.exchange(-1);
+        if (handle < 0) return;
         bool attached = false;
         JNIEnv* env = envOf(&attached);
         if (!env || !g_bt) return;
         jclass cls = env->GetObjectClass(g_bt);
         jmethodID m = env->GetMethodID(cls, "close", "(I)V");
         env->DeleteLocalRef(cls);
-        if (m) env->CallVoidMethod(g_bt, m, jint(handle_));
+        if (m) env->CallVoidMethod(g_bt, m, jint(handle));
         if (attached) g_vm->DetachCurrentThread();
-        handle_ = -1;
     }
 
 private:
-    int handle_ = -1;
+    std::atomic<int> handle_;
+    std::atomic<bool> closed_{false};
 };
 
 // JniBluetooth —— IBluetooth：下调 Kotlin BluetoothService
@@ -210,10 +218,17 @@ public:
 private:
     void closeStream()
     {
-        if (currentStream_) { delete currentStream_; currentStream_ = nullptr; }
+        if (!currentStream_) return;
+        currentStream_->close();
+        // 蓝牙触发线程是 detach 的，可能仍持有这个指针；直接 delete 会在 nativeStop/重连时
+        // 变成 use-after-free（真机 SIGSEGV 在 WirelessTrigger::run 里就是这么来的）。
+        // 关闭后保留对象到进程结束：数量等于重连次数，每个几十字节，换来的是不会崩。
+        retiredStreams_.push_back(currentStream_);
+        currentStream_ = nullptr;
     }
 
     core::IByteStream* currentStream_ = nullptr;
+    std::vector<core::IByteStream*> retiredStreams_;
 };
 
 // ---------------------------------------------------------------------------
@@ -431,6 +446,7 @@ Java_com_allplay_app_NativeAllPlay_nativeStart(JNIEnv* env, jobject,
     std::string err;
     if (!g_receiver->start(g_cfg, g_services, &err)) return -1;
     const jint port = jint(g_receiver->port());
+    g_btTriggerStop.store(false);   // 新会话：允许蓝牙触发线程工作
     LOGI("nativeStart ok: port=%d ip=%s deviceid=%s btMac=%s ssid=%s",
          int(port), g_receiver->ip().c_str(), g_receiver->info().deviceId.c_str(),
          btMacStr.c_str(), ssidStr.c_str());
@@ -474,6 +490,10 @@ Java_com_allplay_app_NativeAllPlay_nativeStart(JNIEnv* env, jobject,
             constexpr int kTriggerAttempts = 10;
             constexpr int kRetryDelayMs    = 3000;
             for (;;) {
+                if (g_btTriggerStop.load()) {
+                    LOGI("bt trigger 线程退出（nativeStop）");
+                    return;
+                }
                 bool triggered = false;
                 for (int attempt = 1; attempt <= kTriggerAttempts; ++attempt) {
                     auto r = core::bt::runBtTrigger(s_bt, bp, [](const std::string& s) { LOGI("[bt] %s", s.c_str()); });
@@ -493,6 +513,7 @@ Java_com_allplay_app_NativeAllPlay_nativeStart(JNIEnv* env, jobject,
                 // 等 AirPlay 会话建立（sessionActive → true），最多 60 秒
                 bool becameActive = false;
                 for (int i = 0; i < 60; ++i) {
+                    if (g_btTriggerStop.load()) return;
                     if (g_receiver && g_receiver->sessionActive()) { becameActive = true; break; }
                     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                 }
@@ -502,6 +523,7 @@ Java_com_allplay_app_NativeAllPlay_nativeStart(JNIEnv* env, jobject,
                 }
                 // 等 AirPlay 会话断开（sessionActive → false），再重新触发
                 while (g_receiver && g_receiver->sessionActive()) {
+                    if (g_btTriggerStop.load()) return;
                     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                 }
                 LOGI("AirPlay 会话已断开，重新触发蓝牙");
@@ -518,6 +540,7 @@ Java_com_allplay_app_NativeAllPlay_nativeStart(JNIEnv* env, jobject,
 JNIEXPORT void JNICALL
 Java_com_allplay_app_NativeAllPlay_nativeStop(JNIEnv* env, jobject)
 {
+    g_btTriggerStop.store(true);   // 先让触发线程退出，再拆对象
     if (g_receiver) { g_receiver->stop(); g_receiver.reset(); }
     delete s_bt;    s_bt = nullptr;
     delete s_mdns;  s_mdns = nullptr;
